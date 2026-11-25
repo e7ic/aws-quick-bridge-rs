@@ -1,0 +1,73 @@
+[package]
+name = "aws-quick-bridge-rs"
+version = "0.1.0"
+edition = "2024"
+default-run = "aws-quick-bridge-rs"
+description = "Rust implementation of Amazon Quick (QuickWork) bridge with Magpie-style multi-account pool, Anthropic/OpenAI gateway, CC Switch integration, and GPUI desktop app."
+license = "GPL-3.0-only"
+
+[features]
+default = ["gui"]
+gui = ["dep:gpui", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:raw-window-handle", "dep:tempfile", "dep:windows-sys"]
+
+[dependencies]
+# 异步运行时与网络栈
+tokio = { version = "1.54", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+bytes = "1.12"
+http = "1.5"
+axum = { version = "0.8", features = ["json", "query", "tokio"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "stream", "http2", "charset", "system-proxy"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+url = "2.5"
+urlencoding = "2.1"
+
+# 序列化与二进制帧编解码
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+flate2 = "1.1"
+crc32fast = "1.5"
+base64 = "0.23"
+
+# 加密、哈希、ID、时间与正则
+sha2 = "0.11"
+hex = "0.4"
+uuid = { version = "1.29", features = ["v4"] }
+rand = "0.10"
+subtle = "2.6"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.13"
+
+# 命令行、系统集成与错误处理
+clap = { version = "4.6", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "2.0"
+dirs = "7.0"
+open = "5.4"
+parking_lot = "0.13"
+
+# 原生 GPUI 桌面界面（启用 runtime_shaders 避免依赖离线 Xcode MetalToolchain）
+gpui = { version = "0.2.2", features = ["runtime_shaders"], optional = true }
+tempfile = { version = "3.27", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.5", optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSImage", "NSRunningApplication", "NSWorkspace"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSString"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = { version = "0.6", optional = true }
+windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3.0.12"
+
+[dev-dependencies]
+tempfile = "3.27"
