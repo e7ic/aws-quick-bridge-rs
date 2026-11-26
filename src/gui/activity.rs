@@ -431,6 +431,7 @@ mod tests {
             input_tokens: 30,
             output_tokens: 10,
             cached_tokens: 15,
+            context: None,
             message: String::new(),
         };
         let logs = [

@@ -1,3 +1,5 @@
+mod context;
+
 use super::charts::format_tokens;
 use super::components::{BtnVariant, Theme};
 use super::motion::{self, SpringConfig};
@@ -110,6 +112,7 @@ pub(super) struct UsageView {
     range: UsageRange,
     metric: UsageMetric,
     filters: UsageFilters,
+    context_page: usize,
 }
 
 #[derive(Default)]
@@ -270,7 +273,10 @@ impl BridgeApp {
                         format!("usage-range-{index}"),
                         range.label(),
                         usage.range == range,
-                        move |this, _, _| this.usage.range = range,
+                        move |this, _, _| {
+                            this.usage.range = range;
+                            this.usage.context_page = 0;
+                        },
                         cx,
                     )
                 })
@@ -278,6 +284,7 @@ impl BridgeApp {
         );
         let has_history = !summary.known_models.is_empty();
         let total = summary.total;
+        let tokens = total.tokens();
         let coverage = history.started_on.map_or_else(
             || "本地保留最近 30 天 · 首次对话后开始记录".to_owned(),
             |date| format!("本地保留最近 30 天 · 记录始于 {}", date.format("%Y-%m-%d")),
@@ -292,13 +299,16 @@ impl BridgeApp {
                 .when(has_history, |el| el.child(range_picker)),
         );
         let page = if has_history {
-            page.child(self.usage_filters(
-                t,
-                &accounts,
-                &summary.known_models,
-                &summary.known_protocols,
-                compact,
-                cx,
+            page.child(motion::layout(
+                self.usage_filters(
+                    t,
+                    &accounts,
+                    &summary.known_models,
+                    &summary.known_protocols,
+                    compact,
+                    cx,
+                )
+                .id("usage-filters"),
             ))
         } else {
             page
@@ -309,7 +319,7 @@ impl BridgeApp {
             } else {
                 (
                     "暂无用量记录",
-                    "连接客户端并发送对话后，这里会显示用量趋势和排行。",
+                    "连接客户端并发送对话后，这里会显示用量趋势、排行和请求上下文。",
                 )
             };
             return page
@@ -345,12 +355,16 @@ impl BridgeApp {
             div()
                 .flex()
                 .gap(px(8.0))
-                .child(
+                .child(motion::layout(
                     Self::kpi_card(
                         t,
                         "icons/cpu-bolt-bold.svg",
                         "Token 用量",
-                        format_tokens(total.tokens()),
+                        motion::rolling_number(
+                            "usage-tokens",
+                            format_tokens(tokens),
+                            tokens as f64,
+                        ),
                         format!(
                             "输入 {} · 输出 {}",
                             format_tokens(total.input),
@@ -363,63 +377,82 @@ impl BridgeApp {
                         t,
                         format!(
                             "输入 {} · 输出 {} · 合计 {}",
-                            total.input,
-                            total.output,
-                            total.tokens()
+                            total.input, total.output, tokens
                         ),
                     )),
-                )
-                .child(
+                ))
+                .child(motion::layout(
                     Self::kpi_card(
                         t,
                         "icons/server-bold.svg",
                         "缓存读取",
-                        format_tokens(total.cache_read),
+                        motion::rolling_number(
+                            "usage-cache-read",
+                            format_tokens(total.cache_read),
+                            total.cache_read as f64,
+                        ),
                         "计入输入 Token",
                         None,
                     )
                     .id("usage-cache-total")
                     .tooltip(Self::text_tooltip(t, total.cache_read.to_string())),
-                )
-                .child(
+                ))
+                .child(motion::layout(
                     Self::kpi_card(
                         t,
                         Tab::Usage.icon_path(),
                         "调用次数",
-                        format_tokens(total.calls),
+                        motion::rolling_number(
+                            "usage-calls",
+                            format_tokens(total.calls),
+                            total.calls as f64,
+                        ),
                         "换号重试分别计次",
                         None,
                     )
                     .id("usage-call-total")
                     .tooltip(Self::text_tooltip(t, format!("{} 次调用", total.calls))),
-                ),
+                )),
         )
-        .child(self.usage_trend(t, &summary, now.hour(), cx))
+        .child(motion::layout(
+            self.usage_trend(t, &summary, now.hour(), cx)
+                .id("usage-trends"),
+        ))
         .child(
             div()
                 .flex()
                 .when(compact, |el| el.flex_col())
                 .gap(px(12.0))
-                .child(Self::usage_ranking(
-                    t,
-                    "账号排行",
-                    usage.metric,
-                    compact,
-                    summary.accounts.into_iter().map(|(key, totals)| {
-                        (key, accounts.get(key).copied().unwrap_or(key), totals)
-                    }),
+                .child(motion::layout(
+                    Self::usage_ranking(
+                        t,
+                        "账号排行",
+                        usage.metric,
+                        compact,
+                        summary.accounts.into_iter().map(|(key, totals)| {
+                            (key, accounts.get(key).copied().unwrap_or(key), totals)
+                        }),
+                    )
+                    .id("usage-accounts"),
                 ))
-                .child(Self::usage_ranking(
-                    t,
-                    "实际模型排行",
-                    usage.metric,
-                    compact,
-                    summary
-                        .models
-                        .into_iter()
-                        .map(|(model, totals)| (model, model_label(model), totals)),
+                .child(motion::layout(
+                    Self::usage_ranking(
+                        t,
+                        "实际模型排行",
+                        usage.metric,
+                        compact,
+                        summary
+                            .models
+                            .into_iter()
+                            .map(|(model, totals)| (model, model_label(model), totals)),
+                    )
+                    .id("usage-models"),
                 )),
         )
+        .child(motion::layout(
+            self.usage_contexts(t, &history, summary.start, now.date_naive(), compact, cx)
+                .id("usage-contexts"),
+        ))
         .child(
             div()
                 .text_size(px(11.0))
@@ -533,6 +566,7 @@ impl BridgeApp {
                 |this, _, _| {
                     this.usage.filters = UsageFilters::default();
                     this.usage.dropdown = None;
+                    this.usage.context_page = 0;
                 },
                 cx,
             )
@@ -605,7 +639,7 @@ impl BridgeApp {
         dimension: UsageDimension,
         choices: Vec<(UsageChoice, String)>,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> AnyElement {
         let label = choices
             .iter()
             .find(|(choice, _)| self.usage.filters.selected(choice))
@@ -645,11 +679,12 @@ impl BridgeApp {
             });
             cx.notify();
         };
-        div()
+        let picker = div()
+            .id(("usage-picker-container", dimension as usize))
             .relative()
             .min_w(px(0.0))
             .flex_1()
-            .child(
+            .child(motion::layout(
                 div()
                     .id(("usage-picker", dimension as usize))
                     .min_w(px(0.0))
@@ -706,7 +741,7 @@ impl BridgeApp {
                                 .with_transformation(Transformation::rotate(radians(PI * progress)))
                         },
                     )),
-            )
+            ))
             .when_some(open, |el, dropdown| {
                 el.child(
                     div()
@@ -726,7 +761,8 @@ impl BridgeApp {
                             .with_priority(2),
                         ),
                 )
-            })
+            });
+        motion::layout(picker).into_any_element()
     }
 
     fn usage_options(
@@ -780,6 +816,7 @@ impl BridgeApp {
                                     return;
                                 }
                                 this.usage.filters.select(choice.clone());
+                                this.usage.context_page = 0;
                                 this.dismiss_usage_dropdown(window, cx);
                             };
                         let pick_key = pick.clone();
@@ -838,7 +875,7 @@ impl BridgeApp {
             } else {
                 SpringConfig::EXIT
             },
-            card,
+            motion::layout(card).anchored(),
         )
     }
 
@@ -1083,50 +1120,57 @@ impl BridgeApp {
                 div()
                     .id(title)
                     .children(rows.into_iter().take(RANK_LIMIT).enumerate().map(
-                        |(index, (_, label, totals))| {
+                        |(index, (key, label, totals))| {
                             let tooltip = format!(
                                 "{label} · Token {} · 缓存读取 {} · {} 次调用",
                                 totals.tokens(),
                                 totals.cache_read,
                                 totals.calls,
                             );
-                            div()
-                                .id(("usage-rank", index))
-                                .flex()
-                                .items_center()
-                                .gap(px(9.0))
-                                .h(px(34.0))
-                                .border_t_1()
-                                .border_color(t.border_subtle)
-                                .text_size(px(12.0))
-                                .tooltip(Self::text_tooltip(t, tooltip))
-                                .child(
-                                    div()
-                                        .size(px(20.0))
-                                        .flex_shrink_0()
-                                        .rounded(px(5.0))
-                                        .bg(t.bg_seg_track)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .font(numeric_font())
-                                        .text_color(t.text_muted)
-                                        .child((index + 1).to_string()),
-                                )
-                                .child(
-                                    div()
-                                        .min_w(px(0.0))
-                                        .flex_1()
-                                        .truncate()
-                                        .child(SharedString::from(label.to_owned())),
-                                )
-                                .child(
-                                    div()
-                                        .font(numeric_font())
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .flex_shrink_0()
-                                        .child(format_tokens(metric.value(totals))),
-                                )
+                            let value = metric.value(totals);
+                            motion::layout(
+                                div()
+                                    .id(SharedString::from(key.to_owned()))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(9.0))
+                                    .h(px(34.0))
+                                    .border_t_1()
+                                    .border_color(t.border_subtle)
+                                    .text_size(px(12.0))
+                                    .tooltip(Self::text_tooltip(t, tooltip))
+                                    .child(
+                                        div()
+                                            .size(px(20.0))
+                                            .flex_shrink_0()
+                                            .rounded(px(5.0))
+                                            .bg(t.bg_seg_track)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .font(numeric_font())
+                                            .text_color(t.text_muted)
+                                            .child((index + 1).to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w(px(0.0))
+                                            .flex_1()
+                                            .truncate()
+                                            .child(SharedString::from(label.to_owned())),
+                                    )
+                                    .child(
+                                        div()
+                                            .font(numeric_font())
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .flex_shrink_0()
+                                            .child(motion::rolling_number(
+                                                ("value", metric as usize),
+                                                format_tokens(value),
+                                                value as f64,
+                                            )),
+                                    ),
+                            )
                         },
                     )),
             )

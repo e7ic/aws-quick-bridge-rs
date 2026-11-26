@@ -4,9 +4,9 @@ use super::motion::{self, SpringConfig};
 use super::{BridgeApp, numeric_font};
 use chrono::{DateTime, Local, TimeDelta, Utc};
 use gpui::{
-    Animation, AnimationExt, AnyElement, Bounds, ContentMask, Context, Div, FontWeight, Hsla,
-    PathBuilder, Pixels, Point, Window, canvas, div, ease_in_out, fill, linear_color_stop,
-    linear_gradient, point, prelude::*, px, relative, size,
+    AnyElement, Bounds, ContentMask, Context, Div, FontWeight, Hsla, PathBuilder, Pixels, Point,
+    Window, canvas, div, fill, linear_color_stop, linear_gradient, point, prelude::*, px, relative,
+    size,
 };
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 use std::time::Duration;
@@ -365,11 +365,13 @@ impl BridgeApp {
                     .flex_wrap()
                     .gap(px(8.0))
                     .child(metric_control)
-                    .child(motion::fade_in(
-                        ("activity-chart-summary", chart_id),
-                        motion::CONTENT_FADE_DURATION,
-                        Self::trend_summary(t, activity, metric),
-                    )),
+                    .child(motion::layout(div().id("activity-summary").child(
+                        motion::fade_in(
+                            ("activity-chart-summary", chart_id),
+                            motion::CONTENT_FADE_DURATION,
+                            Self::trend_summary(t, activity, metric),
+                        ),
+                    ))),
             )
             .child(motion::fade_in(
                 ("activity-chart", chart_id),
@@ -382,18 +384,19 @@ impl BridgeApp {
         match metric {
             TrendMetric::Requests => Self::value_with_unit(
                 t,
-                activity.requests.to_string(),
+                motion::rolling_count("trend-requests", activity.requests as u64),
                 Some("次对话请求"),
                 23.0,
                 t.text_primary,
             ),
             TrendMetric::Latency => {
-                let p50 = activity
-                    .latency
-                    .map(|latency| format_duration(latency.p50_ms));
-                let p95 = activity
-                    .latency
-                    .map(|latency| format_duration(latency.p95_ms));
+                let latency_value = |id, ms: Option<u64>| {
+                    motion::rolling_number(
+                        id,
+                        ms.map_or_else(|| "—".into(), format_duration),
+                        ms.map(|ms| ms as f64),
+                    )
+                };
                 div()
                     .flex()
                     .items_center()
@@ -402,13 +405,13 @@ impl BridgeApp {
                         t,
                         t.series_blue,
                         "P50",
-                        p50.unwrap_or_else(|| "—".into()),
+                        latency_value("trend-p50", activity.latency.map(|latency| latency.p50_ms)),
                     ))
                     .child(Self::series_value(
                         t,
                         t.accent,
                         "P95",
-                        p95.unwrap_or_else(|| "—".into()),
+                        latency_value("trend-p95", activity.latency.map(|latency| latency.p95_ms)),
                     ))
             }
             TrendMetric::Tokens => div()
@@ -419,18 +422,26 @@ impl BridgeApp {
                     t,
                     t.accent,
                     "输入",
-                    format_tokens(activity.input_tokens),
+                    motion::rolling_number(
+                        "trend-input-tokens",
+                        format_tokens(activity.input_tokens),
+                        activity.input_tokens as f64,
+                    ),
                 ))
                 .child(Self::series_value(
                     t,
                     t.series_blue,
                     "输出",
-                    format_tokens(activity.output_tokens),
+                    motion::rolling_number(
+                        "trend-output-tokens",
+                        format_tokens(activity.output_tokens),
+                        activity.output_tokens as f64,
+                    ),
                 )),
         }
     }
 
-    fn series_value(t: Theme, color: Hsla, label: &'static str, value: String) -> Div {
+    fn series_value(t: Theme, color: Hsla, label: &'static str, value: impl IntoElement) -> Div {
         div()
             .flex()
             .items_center()
@@ -548,79 +559,73 @@ impl BridgeApp {
         buckets: &[ActivityBucket; ACTIVITY_BUCKETS],
         ceiling: u64,
     ) -> impl IntoElement {
-        let p50 = buckets.map(|bucket| bucket.latency.map(|latency| latency.p50_ms));
-        let p95 = buckets.map(|bucket| bucket.latency.map(|latency| latency.p95_ms));
-        let span = p95
+        let present = buckets.map(|bucket| bucket.latency.is_some());
+        let span = present
             .iter()
-            .position(Option::is_some)
-            .zip(p95.iter().rposition(Option::is_some))
+            .position(|&visible| visible)
+            .zip(present.iter().rposition(|&visible| visible))
             .filter(|(first, last)| first < last);
+        let targets: [f32; ACTIVITY_BUCKETS * 2] = std::array::from_fn(|index| {
+            let value = buckets[index % ACTIVITY_BUCKETS]
+                .latency
+                .map_or(0, |latency| {
+                    if index < ACTIVITY_BUCKETS {
+                        latency.p50_ms
+                    } else {
+                        latency.p95_ms
+                    }
+                });
+            chart_fraction(value, ceiling)
+        });
+        let reduced = motion::is_reduced_motion();
 
-        let paint_lines = move |window: &mut Window, bounds: Bounds<Pixels>, opacity: f32| {
-            paint_line(
-                window,
-                bounds,
-                p95,
-                ceiling,
-                t.accent.opacity(opacity),
-                2.4,
-            );
-            paint_line(
-                window,
-                bounds,
-                p50,
-                ceiling,
-                t.series_blue.opacity(opacity),
-                1.6,
-            );
-        };
-
-        if super::motion::is_reduced_motion() {
-            return div()
-                .absolute()
-                .inset_0()
-                .child(
-                    canvas(
-                        |_, _, _| (),
-                        move |bounds, (), window, _| paint_lines(window, bounds, 1.0),
-                    )
-                    .size_full(),
-                )
-                .into_any_element();
-        }
-
-        div()
-            .absolute()
-            .inset_0()
-            .with_animation(
-                "latency-line-reveal",
-                Animation::new(Duration::from_millis(260)).with_easing(ease_in_out),
-                move |layer, progress| {
-                    layer.child(
+        motion::spring_values(
+            "latency-points",
+            targets,
+            SpringConfig::GENTLE,
+            move |values| {
+                let p50 = std::array::from_fn(|index| present[index].then_some(values[index]));
+                let p95 = std::array::from_fn(|index| {
+                    present[index].then_some(values[ACTIVITY_BUCKETS + index])
+                });
+                let draw = move |phase| {
+                    let progress = motion::ease_out_cubic(phase);
+                    div().absolute().inset_0().child(
                         canvas(
                             |_, _, _| (),
                             move |bounds, (), window, _| {
-                                if let Some((first, last)) = span.filter(|_| progress < 1.0) {
-                                    let mask = ContentMask {
-                                        bounds: latency_reveal_bounds(bounds, first, last, progress),
-                                    };
-                                    window.with_content_mask(Some(mask), |window| {
-                                        paint_lines(window, bounds, 1.0);
-                                    });
-                                } else {
-                                    paint_lines(
+                                let mask = span.filter(|_| progress < 1.0).map(|(first, last)| {
+                                    ContentMask {
+                                        bounds: latency_reveal_bounds(
+                                            bounds, first, last, progress,
+                                        ),
+                                    }
+                                });
+                                let opacity = if span.is_none() { progress } else { 1.0 };
+                                window.with_content_mask(mask, |window| {
+                                    paint_line(window, bounds, p95, t.accent.opacity(opacity), 2.4);
+                                    paint_line(
                                         window,
                                         bounds,
-                                        if span.is_some() { 1.0 } else { progress },
+                                        p50,
+                                        t.series_blue.opacity(opacity),
+                                        1.6,
                                     );
-                                }
+                                });
                             },
                         )
                         .size_full(),
                     )
-                },
-            )
-            .into_any_element()
+                };
+                if reduced {
+                    draw(1.0).into_any_element()
+                } else {
+                    motion::timeline("latency-line-reveal", Duration::from_millis(240), draw)
+                        .into_any_element()
+                }
+            },
+        )
+        .settle_at_scale(PLOT_HEIGHT - 6.0)
     }
 
     fn trend_bar(
@@ -734,59 +739,98 @@ impl BridgeApp {
                     protocols.map(|(_, count, color)| (count, color)),
                 ))
             })
-            .children(protocols.into_iter().enumerate().map(|(index, (label, count, color))| {
-                let share = count as f32 / total.max(1) as f32;
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(6.0))
-                            .text_size(px(12.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .size(px(7.0))
-                                            .flex_shrink_0()
-                                            .rounded_full()
-                                            .bg(color),
+            .children(
+                protocols
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (label, count, color))| {
+                        let share = count as f32 / total.max(1) as f32;
+                        let count = motion::rolling_count(("protocol-count", index), count as u64);
+                        let percent = motion::rolling_number(
+                            ("protocol-percent", index),
+                            format!("{:.0}%", share * 100.0),
+                            f64::from(share),
+                        );
+                        motion::layout(
+                            div()
+                                .id(("protocol-row", index))
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(6.0))
+                                        .text_size(px(12.0))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_1()
+                                                .min_w(px(0.0))
+                                                .items_center()
+                                                .gap(px(6.0))
+                                                .child(
+                                                    div()
+                                                        .size(px(7.0))
+                                                        .flex_shrink_0()
+                                                        .rounded_full()
+                                                        .bg(color),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .min_w(px(0.0))
+                                                        .truncate()
+                                                        .text_color(t.text_secondary)
+                                                        .child(label),
+                                                ),
+                                        )
+                                        .child(motion::layout(
+                                            div()
+                                                .id("protocol-values")
+                                                .flex()
+                                                .flex_shrink_0()
+                                                .items_center()
+                                                .gap(px(6.0))
+                                                .font(numeric_font())
+                                                .child(
+                                                    div()
+                                                        .w(px(44.0))
+                                                        .flex_shrink_0()
+                                                        .flex()
+                                                        .justify_end()
+                                                        .text_right()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .child(count),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(32.0))
+                                                        .flex_shrink_0()
+                                                        .flex()
+                                                        .justify_end()
+                                                        .text_right()
+                                                        .text_size(px(11.0))
+                                                        .text_color(t.text_muted)
+                                                        .child(percent),
+                                                ),
+                                        )),
+                                )
+                                .when(!is_donut, |el| {
+                                    el.child(
+                                        Self::hatched_track(
+                                            t,
+                                            format!("protocol-bar-{index}"),
+                                            share,
+                                            color,
+                                        )
+                                        .h(px(8.0)),
                                     )
-                                    .child(div().text_color(t.text_secondary).child(label)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .font(numeric_font())
-                                    .child(
-                                        div()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .child(count.to_string()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .text_color(t.text_muted)
-                                            .child(format!("{:.0}%", share * 100.0)),
-                                    ),
-                            ),
-                    )
-                    .when(!is_donut, |el| {
-                        el.child(
-                            Self::hatched_track(t, format!("protocol-bar-{index}"), share, color)
-                                .h(px(8.0)),
+                                }),
                         )
-                    })
-            }))
+                    }),
+            )
     }
 
     fn protocol_ring(t: Theme, total: usize, slices: [(usize, Hsla); 3]) -> Div {
@@ -805,29 +849,32 @@ impl BridgeApp {
             div()
                 .relative()
                 .size(px(106.0))
-                .child(motion::spring_values(
-                    "protocol-ring-slices",
-                    targets,
-                    SpringConfig::GENTLE,
-                    move |shares| {
-                        canvas(
-                            |_, _, _| (),
-                            move |bounds, (), window, _| {
-                                paint_ring_shares(
-                                    window,
-                                    bounds,
-                                    t,
-                                    [
-                                        (shares[0], colors[0]),
-                                        (shares[1], colors[1]),
-                                        (shares[2], colors[2]),
-                                    ],
-                                );
-                            },
-                        )
-                        .size_full()
-                    },
-                ))
+                .child(
+                    motion::spring_values(
+                        "protocol-ring-slices",
+                        targets,
+                        SpringConfig::GENTLE,
+                        move |shares| {
+                            canvas(
+                                |_, _, _| (),
+                                move |bounds, (), window, _| {
+                                    paint_ring_shares(
+                                        window,
+                                        bounds,
+                                        t,
+                                        [
+                                            (shares[0], colors[0]),
+                                            (shares[1], colors[1]),
+                                            (shares[2], colors[2]),
+                                        ],
+                                    );
+                                },
+                            )
+                            .size_full()
+                        },
+                    )
+                    .settle_at_scale(106.0 * TAU * 0.5),
+                )
                 .child(
                     div()
                         .absolute()
@@ -841,7 +888,7 @@ impl BridgeApp {
                                 .text_size(px(21.0))
                                 .font(numeric_font())
                                 .font_weight(FontWeight::MEDIUM)
-                                .child(total.to_string()),
+                                .child(motion::rolling_count("protocol-total", total as u64)),
                         )
                         .child(
                             div()
@@ -927,8 +974,7 @@ fn latency_reveal_bounds(
 fn paint_line(
     window: &mut Window,
     bounds: Bounds<Pixels>,
-    values: [Option<u64>; ACTIVITY_BUCKETS],
-    ceiling: u64,
+    values: [Option<f32>; ACTIVITY_BUCKETS],
     color: Hsla,
     width: f32,
 ) {
@@ -942,7 +988,7 @@ fn paint_line(
             previous = false;
             continue;
         };
-        let y = 1.0 - chart_fraction(value, ceiling);
+        let y = 1.0 - value.clamp(0.0, 1.0);
         let marker = point(
             latency_bucket_x(bounds, index),
             bounds.origin.y + px(3.0) + (bounds.size.height - px(6.0)) * y,
@@ -966,14 +1012,23 @@ fn paint_line(
     }
 }
 
-fn paint_ring_shares(window: &mut Window, bounds: Bounds<Pixels>, t: Theme, slices: [(f32, Hsla); 3]) {
+fn paint_ring_shares(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    t: Theme,
+    slices: [(f32, Hsla); 3],
+) {
     let center = bounds.center();
     let radius = bounds.size.width * 0.5;
     let track = circle_bounds(center, radius);
     window.paint_quad(fill(track, t.border_subtle).corner_radii(radius));
 
     let active_sum: f32 = slices.iter().map(|(share, _)| share.max(0.0)).sum();
-    let scale = if active_sum > 1.0 { 1.0 / active_sum } else { 1.0 };
+    let scale = if active_sum > 1.0 {
+        1.0 / active_sum
+    } else {
+        1.0
+    };
     let mut angle = -FRAC_PI_2;
     for (raw_share, color) in slices {
         let share = raw_share.max(0.0) * scale;

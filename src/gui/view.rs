@@ -17,6 +17,7 @@ use gpui::{
     prelude::*, px, radians, relative, rgba,
 };
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -105,21 +106,23 @@ impl BridgeApp {
         id: impl Into<SharedString>,
         label: &'static str,
         value: String,
+        variant: BtnVariant,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let id = id.into();
         let copied = Self::is_copied(shared, &id);
         let anim_id = SharedString::from(format!("copy-state-{id}-{}", u8::from(copied)));
+        let variant = match (copied, variant) {
+            (true, BtnVariant::Text(_)) => BtnVariant::Text(t.green_text),
+            (true, _) => BtnVariant::SoftSuccess,
+            (false, variant) => variant,
+        };
         Self::button_with_content(
             t,
             id.clone(),
             false,
             !label.is_empty(),
-            if copied {
-                BtnVariant::SoftSuccess
-            } else {
-                BtnVariant::Ghost
-            },
+            variant,
             move |color| {
                 let icon = if copied {
                     "icons/check-circle-bold.svg"
@@ -336,7 +339,7 @@ impl BridgeApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = self.active_tab == tab;
-        div()
+        let item = div()
             .id(tab.title())
             .flex()
             .items_center()
@@ -359,10 +362,6 @@ impl BridgeApp {
             } else {
                 t.text_secondary
             })
-            .when(!active, |el| {
-                el.hover(move |style| style.bg(t.bg_hover).text_color(t.text_primary))
-            })
-            .active(|style| style.opacity(0.76))
             .child(Self::icon(
                 tab.icon_path(),
                 15.0,
@@ -383,7 +382,16 @@ impl BridgeApp {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.switch_tab(tab);
                 cx.notify();
-            }))
+            }));
+        motion::layout(motion::control_feedback(
+            item,
+            move |style, hover, press| {
+                if !active {
+                    style.background = Some(t.bg_hover.opacity(hover).into());
+                }
+                style.opacity = Some(1.0 - 0.08 * press);
+            },
+        ))
     }
 
     fn render_sidebar(
@@ -573,9 +581,8 @@ impl BridgeApp {
                 .flex_grow()
                 .gap(px(14.0))
         };
-        if loading {
-            let count = if windows.is_empty() { 2 } else { windows.len() };
-            panel.child(grid(count).children((0..count).map(|index| {
+        if windows.is_empty() && loading {
+            panel.child(grid(2).children((0..2).map(|index| {
                 Self::quota_balance_skeleton(t, format!("quota-loading-{}-{index}", account.key))
             })))
         } else if windows.is_empty() {
@@ -604,29 +611,21 @@ impl BridgeApp {
                     .child(label),
             ))
         } else {
-            let balances =
-                grid(windows.len()).children(windows.iter().enumerate().map(|(index, quota)| {
-                    Self::quota_balance_metric(
-                        t,
-                        quota,
-                        history,
-                        account.quota_updated_at,
-                        format!("quota-{}-{index}", account.key),
-                    )
-                }));
-            if let Some(refreshed) = account
-                .quota_updated_at
-                .filter(|_| account.quota_error.is_none())
-            {
-                let at = latest.map_or(refreshed, |reading| reading.at);
-                panel.child(motion::fade_in(
-                    SharedString::from(format!("quota-content-{}-{at}", account.key)),
-                    motion::CONTENT_FADE_DURATION,
-                    balances,
-                ))
-            } else {
-                panel.child(balances)
-            }
+            let balances = grid(windows.len()).children(windows.iter().map(|quota| {
+                Self::quota_balance_metric(
+                    t,
+                    quota,
+                    history,
+                    account.quota_updated_at,
+                    loading,
+                    format!("quota-{}-{}", account.key, quota.name),
+                )
+            }));
+            panel.child(motion::fade_in(
+                SharedString::from(format!("quota-content-{}", account.key)),
+                motion::CONTENT_FADE_DURATION,
+                balances,
+            ))
         }
     }
 
@@ -634,7 +633,7 @@ impl BridgeApp {
         t: Theme,
         icon: &'static str,
         label: &'static str,
-        value: String,
+        value: impl IntoElement,
         detail: impl IntoElement,
         trend: Option<AnyElement>,
     ) -> Div {
@@ -666,8 +665,9 @@ impl BridgeApp {
                     )
                     .child(label),
             )
-            .child(
+            .child(motion::layout(
                 Self::card_well(t)
+                    .id("metric-surface")
                     .flex_1()
                     .min_h(px(68.0))
                     .flex()
@@ -701,7 +701,7 @@ impl BridgeApp {
                             .text_color(t.text_muted)
                             .child(detail),
                     ),
-            )
+            ))
     }
 
     fn model_probes(&self, t: Theme, shared: &GuiShared, cx: &mut Context<Self>) -> Div {
@@ -818,7 +818,15 @@ impl BridgeApp {
             Self::connection_row(t, label, address.clone(), icon)
                 .border_b_1()
                 .border_color(t.border_subtle)
-                .child(Self::copy_button(t, shared, id, "复制", address, cx))
+                .child(Self::copy_button(
+                    t,
+                    shared,
+                    id,
+                    "复制",
+                    address,
+                    BtnVariant::Ghost,
+                    cx,
+                ))
         };
         let key_row = Self::connection_row(
             t,
@@ -864,6 +872,7 @@ impl BridgeApp {
                     "key-copy",
                     "复制",
                     self.snapshot.config.api_key.clone(),
+                    BtnVariant::Ghost,
                     cx,
                 )),
         );
@@ -1067,10 +1076,11 @@ impl BridgeApp {
         if self.snapshot.logs.is_empty() {
             return card.child(Self::empty_state(t, Tab::Logs.icon_path(), "暂无请求记录"));
         }
-        for entry in self.snapshot.logs.iter().rev().take(5) {
+        for (entry, occurrence) in Self::log_rows(&self.snapshot.logs).take(5) {
             let (_, _, _, dot) = Self::log_colors(t, entry.level);
-            card = card.child(
+            card = card.child(motion::layout(
                 div()
+                    .id((SharedString::from(entry.timestamp.to_rfc3339()), occurrence))
                     .flex()
                     .items_center()
                     .gap(px(8.0))
@@ -1101,7 +1111,7 @@ impl BridgeApp {
                                 .child(format!("{} ms", entry.latency_ms)),
                         )
                     }),
-            );
+            ));
         }
         card
     }
@@ -1182,53 +1192,70 @@ impl BridgeApp {
         let success_rate =
             success_ratio.map_or_else(|| "—".into(), |ratio| format!("{:.1}%", ratio * 100.0));
         let active = self.snapshot.active_requests;
+        let tokens = activity.tokens();
 
-        let kpi_accounts = Self::kpi_card(
-            t,
-            Tab::Accounts.icon_path(),
-            "可用账号",
-            healthy.to_string(),
-            format!("共 {total} 个账号"),
-            None,
+        let kpi_accounts = motion::layout(
+            Self::kpi_card(
+                t,
+                Tab::Accounts.icon_path(),
+                "可用账号",
+                motion::rolling_count("dash-healthy-accounts", healthy as u64),
+                format!("共 {total} 个账号"),
+                None,
+            )
+            .id("dashboard-accounts"),
         );
-        let kpi_requests = Self::kpi_card(
-            t,
-            "icons/chart-square-bold.svg",
-            "累计请求",
-            self.snapshot.total_requests.to_string(),
-            div()
-                .when(active > 0, |el| {
-                    el.child(Self::pill(
-                        format!("{active} 个进行中"),
-                        t.text_secondary,
-                        t.bg_seg_track,
-                        t.border_subtle,
-                        Some(t.series_blue),
-                        None,
-                    ))
-                })
-                .when(active == 0, |el| el.child("历史请求")),
-            None,
+        let kpi_requests = motion::layout(
+            Self::kpi_card(
+                t,
+                "icons/chart-square-bold.svg",
+                "累计请求",
+                motion::rolling_count("dash-total-requests", self.snapshot.total_requests),
+                div()
+                    .when(active > 0, |el| {
+                        el.child(Self::pill(
+                            format!("{active} 个进行中"),
+                            t.text_secondary,
+                            t.bg_seg_track,
+                            t.border_subtle,
+                            Some(t.series_blue),
+                            None,
+                        ))
+                    })
+                    .when(active == 0, |el| el.child("历史请求")),
+                None,
+            )
+            .id("dashboard-requests-total"),
         );
-        let kpi_success = Self::kpi_card(
-            t,
-            "icons/check-circle-bold.svg",
-            "成功率",
-            success_rate,
-            format!("近 {} 小时 · {} 次成功", range.hours(), activity.succeeded),
-            None,
+        let kpi_success = motion::layout(
+            Self::kpi_card(
+                t,
+                "icons/check-circle-bold.svg",
+                "成功率",
+                motion::rolling_number(
+                    "dash-success-rate",
+                    success_rate,
+                    success_ratio.map(f64::from),
+                ),
+                format!("近 {} 小时 · {} 次成功", range.hours(), activity.succeeded),
+                None,
+            )
+            .id("dashboard-success"),
         );
-        let kpi_tokens = Self::kpi_card(
-            t,
-            "icons/cpu-bolt-bold.svg",
-            "Token 用量",
-            format_tokens(activity.tokens()),
-            div().min_w(px(0.0)).truncate().child(format!(
-                "输入 {} · 输出 {}",
-                format_tokens(activity.input_tokens),
-                format_tokens(activity.output_tokens)
-            )),
-            Self::token_sparkline(t, &activity, range),
+        let kpi_tokens = motion::layout(
+            Self::kpi_card(
+                t,
+                "icons/cpu-bolt-bold.svg",
+                "Token 用量",
+                motion::rolling_number("dash-token-usage", format_tokens(tokens), tokens as f64),
+                div().min_w(px(0.0)).truncate().child(format!(
+                    "输入 {} · 输出 {}",
+                    format_tokens(activity.input_tokens),
+                    format_tokens(activity.output_tokens)
+                )),
+                Self::token_sparkline(t, &activity, range),
+            )
+            .id("dashboard-tokens"),
         );
         let metrics = if compact {
             div()
@@ -1301,6 +1328,21 @@ impl BridgeApp {
                     .into_any_element(),
             });
 
+        let analysis = if has_recent_requests {
+            self.request_analysis(t, &activity, now, cx)
+        } else {
+            Self::card(t)
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(Self::section_header(t, "请求分析"))
+                .child(
+                    Self::empty_state(t, "icons/chart-square-bold.svg", "近 24 小时暂无对话请求")
+                        .child(div().text_size(px(12.0)).text_color(t.text_muted).child(
+                            "添加账号、启动网关并连接客户端后，这里会显示请求趋势和协议分布。",
+                        )),
+                )
+        };
         div()
             .flex()
             .flex_col()
@@ -1330,44 +1372,25 @@ impl BridgeApp {
                     )),
             )
             .child(metrics)
-            .when(has_recent_requests, |page| {
-                page.child(
-                    div()
-                        .flex()
-                        .gap(px(12.0))
-                        .when(compact, |el| el.flex_col())
-                        .child(
-                            self.request_analysis(t, &activity, now, cx)
-                                .min_w(px(0.0))
-                                .when(!compact, |el| el.flex_1()),
-                        )
-                        .when(activity.requests > 0, |el| {
-                            el.child(
-                                self.protocol_distribution(t, &activity, cx)
-                                    .when(!compact, |el| el.w(px(248.0)).flex_shrink_0()),
-                            )
-                        }),
-                )
-            })
-            .when(!has_recent_requests, |page| {
-                page.child(
-                    Self::card(t)
-                        .flex()
-                        .flex_col()
-                        .gap(px(8.0))
-                        .child(Self::section_header(t, "请求分析"))
-                        .child(
-                            Self::empty_state(
-                                t,
-                                "icons/chart-square-bold.svg",
-                                "近 24 小时暂无对话请求",
-                            )
-                            .child(div().text_size(px(12.0)).text_color(t.text_muted).child(
-                                "添加账号、启动网关并连接客户端后，这里会显示请求趋势和协议分布。",
-                            )),
-                        ),
-                )
-            })
+            .child(
+                div()
+                    .flex()
+                    .gap(px(12.0))
+                    .when(compact, |el| el.flex_col())
+                    .child(motion::layout(
+                        analysis
+                            .id("dashboard-analysis")
+                            .min_w(px(0.0))
+                            .when(!compact, |el| el.flex_1()),
+                    ))
+                    .when(has_recent_requests && activity.requests > 0, |el| {
+                        el.child(motion::layout(
+                            self.protocol_distribution(t, &activity, cx)
+                                .id("dashboard-protocols")
+                                .when(!compact, |el| el.w(px(248.0)).flex_shrink_0()),
+                        ))
+                    }),
+            )
             .child(
                 div()
                     .flex()
@@ -1380,8 +1403,12 @@ impl BridgeApp {
                             .flex()
                             .flex_col()
                             .gap(px(12.0))
-                            .child(quota)
-                            .when(healthy > 0, |el| el.child(self.model_probes(t, shared, cx))),
+                            .child(motion::layout(quota.id("dashboard-quota")))
+                            .when(healthy > 0, |el| {
+                                el.child(motion::layout(
+                                    self.model_probes(t, shared, cx).id("dashboard-probes"),
+                                ))
+                            }),
                     )
                     .child(
                         div()
@@ -1390,9 +1417,14 @@ impl BridgeApp {
                             .flex()
                             .flex_col()
                             .gap(px(12.0))
-                            .child(self.connection_card(t, shared, cx))
+                            .child(motion::layout(
+                                self.connection_card(t, shared, cx)
+                                    .id("dashboard-connection"),
+                            ))
                             .when(!self.snapshot.logs.is_empty(), |el| {
-                                el.child(self.recent_requests(t, cx))
+                                el.child(motion::layout(
+                                    self.recent_requests(t, cx).id("dashboard-logs"),
+                                ))
                             }),
                     ),
             )
@@ -1471,6 +1503,7 @@ impl BridgeApp {
                                     "login-url-copy",
                                     "复制授权链接",
                                     url.to_string(),
+                                    BtnVariant::Text(t.text_primary),
                                     cx,
                                 )),
                         ))
@@ -1566,14 +1599,16 @@ impl BridgeApp {
         });
         let metrics = [
             (
+                "total-requests",
                 "累计请求",
-                account.total_requests.to_string(),
+                account.total_requests,
                 false,
                 request_trend,
             ),
             (
+                "active-requests",
                 "进行中请求",
-                account.active_requests.to_string(),
+                account.active_requests as u64,
                 in_use,
                 None,
             ),
@@ -1662,10 +1697,14 @@ impl BridgeApp {
             .child(self.account_quota_summary(t, account, loading, "剩余额度"))
             .child(
                 div()
+                    .id(SharedString::from(format!(
+                        "account-metrics-{}",
+                        account.key
+                    )))
                     .grid()
                     .grid_cols(2)
                     .gap(px(14.0))
-                    .children(metrics.into_iter().map(|(label, value, live, trend)| {
+                    .children(metrics.into_iter().map(|(id, label, value, live, trend)| {
                         div()
                             .min_w(px(0.0))
                             .flex()
@@ -1698,7 +1737,7 @@ impl BridgeApp {
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_size(px(20.0))
                                             .truncate()
-                                            .child(value),
+                                            .child(motion::rolling_count(id, value)),
                                     )
                                     .when_some(trend, |row, trend| row.child(trend)),
                             )
@@ -1967,7 +2006,10 @@ impl BridgeApp {
                 .px(px(14.0))
                 .pb(px(14.0))
                 .children(visible_accounts.iter().map(|&(index, account)| {
-                    self.render_account_card(t, shared, account, index, cx)
+                    motion::layout(
+                        self.render_account_card(t, shared, account, index, cx)
+                            .id(SharedString::from(account.key.clone())),
+                    )
                 }));
             panel = panel.child(grid).when(page.has_multiple_pages(), |el| {
                 el.child(Self::table_footer(
@@ -1996,10 +2038,12 @@ impl BridgeApp {
                     0.0,
                     6.0,
                     SpringConfig::SMOOTH,
-                    self.pending_sign_in(t, shared, login_url, cx),
+                    motion::layout(self.pending_sign_in(t, shared, login_url, cx).id("sign-in")),
                 ))
             })
-            .when(!login_busy || !accounts.is_empty(), |el| el.child(panel))
+            .when(!login_busy || !accounts.is_empty(), |el| {
+                el.child(motion::layout(panel.id("account-list")))
+            })
     }
 
     fn render_clients(
@@ -2268,12 +2312,14 @@ impl BridgeApp {
                                     endpoint_copy_id,
                                     "",
                                     endpoint,
+                                    BtnVariant::Ghost,
                                     cx,
                                 )),
                         ),
                 );
 
-            Self::card(t)
+            let card = Self::card(t)
+                .id(app.key)
                 .min_w(px(0.0))
                 .flex()
                 .flex_col()
@@ -2297,6 +2343,7 @@ impl BridgeApp {
                                 format!("client-link-{}", app.key),
                                 "复制导入链接",
                                 link,
+                                BtnVariant::Ghost,
                                 cx,
                             ))
                         })
@@ -2365,7 +2412,8 @@ impl BridgeApp {
                                 cx,
                             ))
                         }),
-                )
+                );
+            motion::layout(card)
         });
 
         div()
@@ -2373,8 +2421,9 @@ impl BridgeApp {
             .flex_col()
             .gap(px(13.0))
             .child(Self::page_heading(t, "客户端接入"))
-            .child(
+            .child(motion::layout(
                 Self::card(t)
+                    .id("client-options")
                     .flex()
                     .items_center()
                     .justify_between()
@@ -2406,7 +2455,7 @@ impl BridgeApp {
                             }),
                     )
                     .child(Self::labeled_control(t, "CC Switch 导入模型", model_choice)),
-            )
+            ))
             .child(
                 div()
                     .grid()
@@ -2416,15 +2465,18 @@ impl BridgeApp {
             )
     }
 
-    fn labeled_control(t: Theme, title: &'static str, control: AnyElement) -> Div {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(10.0))
-            .text_size(px(12.5))
-            .text_color(t.text_secondary)
-            .child(title)
-            .child(control)
+    fn labeled_control(t: Theme, title: &'static str, control: AnyElement) -> impl IntoElement {
+        motion::layout(
+            div()
+                .id(title)
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .text_size(px(12.5))
+                .text_color(t.text_secondary)
+                .child(title)
+                .child(control),
+        )
     }
 
     fn setting_row(
@@ -2432,45 +2484,48 @@ impl BridgeApp {
         title: &'static str,
         detail: &'static str,
         control: AnyElement,
-    ) -> Div {
-        div()
-            .flex()
-            .items_center()
-            .gap(px(18.0))
-            .min_h(px(54.0))
-            .py(px(9.0))
-            .border_t_1()
-            .border_color(t.border_subtle)
-            .child(
-                div()
-                    .w(relative(0.40))
-                    .min_w(px(0.0))
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(t.text_muted)
-                            .child(detail),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .items_center()
-                    .justify_end()
-                    .child(control),
-            )
+    ) -> impl IntoElement {
+        motion::layout(
+            div()
+                .id(title)
+                .flex()
+                .items_center()
+                .gap(px(18.0))
+                .min_h(px(54.0))
+                .py(px(9.0))
+                .border_t_1()
+                .border_color(t.border_subtle)
+                .child(
+                    div()
+                        .w(relative(0.40))
+                        .min_w(px(0.0))
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(t.text_muted)
+                                .child(detail),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .items_center()
+                        .justify_end()
+                        .child(control),
+                ),
+        )
     }
 
     fn render_settings(&self, t: Theme, shared: &GuiShared, cx: &mut Context<Self>) -> Div {
@@ -2578,8 +2633,9 @@ impl BridgeApp {
             .flex_col()
             .gap(px(13.0))
             .child(Self::page_heading(t, "设置"))
-            .child(
+            .child(motion::layout(
                 Self::card(t)
+                    .id("gateway-settings")
                     .flex()
                     .flex_col()
                     .child(Self::section_header(t, "网关"))
@@ -2613,9 +2669,10 @@ impl BridgeApp {
                         "每个账号同时处理的请求上限",
                         concurrency,
                     )),
-            )
-            .child(
+            ))
+            .child(motion::layout(
                 Self::card(t)
+                    .id("conversation-settings")
                     .flex()
                     .flex_col()
                     .child(Self::section_header(t, "对话"))
@@ -2673,9 +2730,10 @@ impl BridgeApp {
                         settings.stable_device_id,
                         cx,
                     )),
-            )
-            .child(
+            ))
+            .child(motion::layout(
                 Self::card(t)
+                    .id("application-settings")
                     .flex()
                     .flex_col()
                     .child(Self::section_header(t, "应用"))
@@ -2744,7 +2802,7 @@ impl BridgeApp {
                             })
                             .into_any_element(),
                     )),
-            )
+            ))
     }
 
     fn log_colors(t: Theme, level: LogLevel) -> (Hsla, Hsla, Hsla, Hsla) {
@@ -2820,7 +2878,17 @@ impl BridgeApp {
         .h(px(17.0))
     }
 
-    fn render_log_entry(t: Theme, entry: &RequestLogEntry, index: usize) -> AnyElement {
+    fn log_rows(logs: &[RequestLogEntry]) -> impl Iterator<Item = (&RequestLogEntry, usize)> {
+        let mut occurrences = HashMap::new();
+        logs.iter().rev().map(move |entry| {
+            let occurrence = occurrences.entry(entry.timestamp).or_insert(0_usize);
+            let row = (entry, *occurrence);
+            *occurrence += 1;
+            row
+        })
+    }
+
+    fn render_log_entry(t: Theme, entry: &RequestLogEntry, occurrence: usize) -> AnyElement {
         let (fg, bg, border, dot) = Self::log_colors(t, entry.level);
         let (level, icon) = match entry.level {
             LogLevel::Info => ("信息", "icons/document-text-bold.svg"),
@@ -2856,14 +2924,15 @@ impl BridgeApp {
             "—".into()
         };
 
-        Self::table_row(t)
-            .id(("log-row", index))
+        let row_id = (SharedString::from(entry.timestamp.to_rfc3339()), occurrence);
+        let row = Self::table_row(t)
+            .id(row_id)
             .hover(move |style| style.bg(t.bg_well))
             .text_size(px(11.5))
             .text_color(t.text_secondary)
             .child(
                 div()
-                    .id(("log-description", index))
+                    .id("log-description")
                     .flex()
                     .flex_1()
                     .min_w(px(0.0))
@@ -2913,7 +2982,7 @@ impl BridgeApp {
             )
             .child(
                 Self::table_cell(110.0)
-                    .id(("log-tokens", index))
+                    .id("log-tokens")
                     .font(numeric_font())
                     .text_right()
                     .when(has_tokens, |el| {
@@ -2944,8 +3013,8 @@ impl BridgeApp {
                             .format("%H:%M:%S")
                             .to_string(),
                     ),
-            )
-            .into_any_element()
+            );
+        motion::layout(row).into_any_element()
     }
 
     fn render_logs(&mut self, t: Theme, cx: &mut Context<Self>) -> Div {
@@ -2977,13 +3046,11 @@ impl BridgeApp {
             || filters.iter().any(|(filter, _, count)| {
                 *filter != LogFilter::All && *count > 0 && *count < logs.len()
             });
-        let mut filtered = logs
-            .iter()
-            .rev()
-            .filter(|entry| self.log_filter.matches(entry.level))
+        let mut filtered = Self::log_rows(logs)
+            .filter(|(entry, _)| self.log_filter.matches(entry.level))
             .collect::<Vec<_>>();
         if self.log_sort != NumberSort::Default {
-            filtered.sort_by(|left, right| {
+            filtered.sort_by(|(left, _), (right, _)| {
                 (left.latency_ms == 0)
                     .cmp(&(right.latency_ms == 0))
                     .then_with(|| self.log_sort.compare(left.latency_ms, right.latency_ms))
@@ -3097,10 +3164,10 @@ impl BridgeApp {
             );
         } else {
             let range = page.range();
-            let first = range.start;
             table = table
-                .child(
+                .child(motion::layout(
                     Self::table_header(t)
+                        .id("log-columns")
                         .child(div().flex_1().min_w(px(0.0)).child("请求详情"))
                         .child(Self::table_cell(72.0).child("级别"))
                         .child(Self::table_cell(48.0).text_right().child("HTTP"))
@@ -3118,12 +3185,11 @@ impl BridgeApp {
                             cx,
                         ))
                         .child(Self::table_cell(68.0).text_right().child("时间")),
-                )
+                ))
                 .children(
                     filtered[range]
                         .iter()
-                        .enumerate()
-                        .map(|(i, entry)| Self::render_log_entry(t, entry, first + i)),
+                        .map(|(entry, occurrence)| Self::render_log_entry(t, entry, *occurrence)),
                 )
                 .when(page.has_multiple_pages(), |el| {
                     el.child(Self::table_footer(
@@ -3141,20 +3207,19 @@ impl BridgeApp {
             .flex_col()
             .gap(px(13.0))
             .child(Self::page_heading(t, "日志"))
-            .child(table)
+            .child(motion::layout(table.id("log-table")))
     }
 }
 
 impl Render for BridgeApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let now = Instant::now();
+        let now = motion::begin_frame(window, cx.entity_id());
         let darkness = self.theme_amount(now);
         if let Some((started, _)) = self.theme_transition {
             if motion::is_reduced_motion() || now.duration_since(started) >= THEME_TRANSITION {
                 self.theme_transition = None;
             } else {
-                let view = cx.entity_id();
-                window.on_next_frame(move |_, app| app.notify(view));
+                motion::request_frame(window);
             }
         }
         let mut t = Theme::interpolated(darkness);
@@ -3171,9 +3236,8 @@ impl Render for BridgeApp {
             Tab::Dashboard => self.render_dashboard(t, &shared, compact, cx),
             Tab::Usage => self.render_usage(t, compact, cx),
             Tab::Accounts => {
-                if self.account_card_highlight.is_animating(Instant::now()) {
-                    let view = cx.entity_id();
-                    window.on_next_frame(move |_, app| app.notify(view));
+                if self.account_card_highlight.is_animating(now) {
+                    motion::request_frame(window);
                 }
                 let columns = if compact {
                     1
@@ -3300,10 +3364,10 @@ impl Render for BridgeApp {
                                     .p(px(page_padding))
                                     .child(motion::slide_fade(
                                         ("page-transition", self.tab_transition_seq),
-                                        0.76,
+                                        0.80,
                                         1.0,
                                         0.0,
-                                        f32::from(self.tab_direction) * 7.0,
+                                        f32::from(self.tab_direction) * 18.0,
                                         SpringConfig::SMOOTH,
                                         content,
                                     )),

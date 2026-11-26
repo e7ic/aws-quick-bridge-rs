@@ -5,14 +5,25 @@
 //! 不允许弹簧超调（`0.0..=1.0` 断言）以及缺少退场周期的限制；空闲态自动停帧零开销。
 
 use gpui::{
-    AlignItems, Animation, AnimationExt, AnyElement, App, BorderStyle, Bounds, BoxShadow, Corners,
-    DefiniteLength, Display, Edges, Element, ElementId, FlexDirection, GlobalElementId, Hsla,
-    InspectorElementId, IntoElement, LayoutId, Length, Pixels, Point, Rgba, SharedString, Style,
-    Styled, Svg, Transformation, Window, ease_out_quint, point, px, quad, radians, size,
+    AlignItems, AnyElement, App, BorderStyle, Bounds, BoxShadow, Corners, DefiniteLength, Display,
+    Edges, Element, ElementId, FlexDirection, GlobalElementId, Hsla, InspectorElementId,
+    IntoElement, LayoutId, Length, Pixels, Point, Rgba, SharedString, Style, Styled, Svg,
+    Transformation, Window, point, px, quad, radians, size,
 };
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+mod feedback;
+mod frame;
+mod layout;
+mod number;
+mod timeline;
+pub(super) use feedback::control_feedback;
+pub(super) use frame::{begin_frame, frame_time, request_frame};
+pub(super) use layout::layout;
+pub(super) use number::{rolling_count, rolling_number};
+pub(super) use timeline::timeline;
 
 static REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
 
@@ -30,8 +41,6 @@ pub(super) fn is_reduced_motion() -> bool {
 pub(super) const EXIT_DURATION: Duration = Duration::from_millis(220);
 pub(super) const CONTENT_FADE_DURATION: Duration = Duration::from_millis(140);
 
-const MAX_DT_SECS: f32 = 0.05;
-const SUB_STEP_SECS: f32 = 1.0 / 240.0;
 const VALUE_EPSILON: f32 = 0.0008;
 const VELOCITY_EPSILON: f32 = 0.005;
 
@@ -43,25 +52,33 @@ pub(super) struct SpringConfig {
 }
 
 impl SpringConfig {
-    /// 带轻微回弹的快速过渡（开关、滑块、导航指示、通知进场）。
+    /// 控件快速就位，收尾只留一点弹性。
     pub(super) const SNAPPY: Self = Self {
-        stiffness: 520.0,
-        damping: 34.0,
+        stiffness: 625.0,
+        damping: 43.0,
     };
-    /// 临界阻尼平滑过渡（页面切换、下拉框进场、进度条）。
+    /// 页面、卡片及弹层重排在同一节奏下收住。
     pub(super) const SMOOTH: Self = Self {
-        stiffness: 340.0,
-        damping: 37.0,
+        stiffness: 484.0,
+        damping: 44.0,
     };
     /// 临界阻尼快速退场（弹窗、下拉菜单、Toast 关闭前收拢至全透明）。
     pub(super) const EXIT: Self = Self {
-        stiffness: 1120.0,
-        damping: 67.0,
+        stiffness: 1600.0,
+        damping: 80.0,
     };
     /// 舒缓的数据视觉过渡（图表柱高、环形图弧度）。
     pub(super) const GENTLE: Self = Self {
-        stiffness: 240.0,
-        damping: 31.0,
+        stiffness: 360.0,
+        damping: 38.0,
+    };
+    pub(super) const FEEDBACK: Self = Self {
+        stiffness: 2304.0,
+        damping: 96.0,
+    };
+    pub(super) const DRAWER: Self = Self {
+        stiffness: 676.0,
+        damping: 40.0,
     };
 }
 
@@ -69,6 +86,10 @@ impl SpringConfig {
 pub(super) fn ease_out_quad(t: f32) -> f32 {
     let clamped = t.clamp(0.0, 1.0);
     1.0 - (1.0 - clamped).powi(2)
+}
+
+pub(super) fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
 }
 
 /// 一维阻尼弹簧状态。
@@ -91,33 +112,67 @@ impl Spring {
         self.velocity = 0.0;
     }
 
-    /// 推进一个帧间隔；返回 `true` 表示仍在运动、需继续请求下一帧。
+    #[cfg(test)]
     pub(super) fn step(&mut self, target: f32, dt_secs: f32, config: SpringConfig) -> bool {
-        if self.value == target && self.velocity == 0.0 {
-            return false;
-        }
-        let mut remaining = dt_secs.clamp(0.0, MAX_DT_SECS);
-        if remaining == 0.0 {
-            return (self.value - target).abs() >= VALUE_EPSILON
-                || self.velocity.abs() >= VELOCITY_EPSILON;
-        }
-        while remaining > 0.0 {
-            let dt = remaining.min(SUB_STEP_SECS);
-            let accel = -config.stiffness * (self.value - target) - config.damping * self.velocity;
-            self.velocity += accel * dt;
-            self.value += self.velocity * dt;
-            remaining -= dt;
-        }
-        if (self.value - target).abs() < VALUE_EPSILON && self.velocity.abs() < VELOCITY_EPSILON {
+        SpringStep::new(dt_secs, config).apply(self, target);
+        if self.settled(target, None) {
             self.snap(target);
             false
         } else {
             true
         }
     }
+
+    fn settled(&self, target: f32, tolerance: Option<f32>) -> bool {
+        let distance = tolerance.unwrap_or(VALUE_EPSILON);
+        let velocity = tolerance.map_or(VELOCITY_EPSILON, |pixels| pixels * 60.0);
+        (self.value - target).abs() <= distance && self.velocity.abs() <= velocity
+    }
 }
 
-/// 在线性 RGBA 空间插值两种 HSLA 颜色，避免中性灰到高饱和色之间出现色相漂移。
+/// Exact solution of the damped spring over one frame, shared by all channels.
+struct SpringStep {
+    position: f32,
+    velocity: f32,
+    cross: f32,
+    stiffness_cross: f32,
+}
+
+impl SpringStep {
+    fn new(dt: f32, config: SpringConfig) -> Self {
+        let damping = config.damping * 0.5;
+        let discriminant = config.stiffness - damping * damping;
+        let (cosine, sine) = if discriminant > 0.0 {
+            let frequency = discriminant.sqrt();
+            let decay = (-damping * dt).exp();
+            let (sine, cosine) = (frequency * dt).sin_cos();
+            (decay * cosine, decay * sine / frequency)
+        } else if discriminant < 0.0 {
+            let frequency = (-discriminant).sqrt();
+            // Evaluate the two decays directly to avoid overflows after a dropped frame.
+            let slow = ((-damping + frequency) * dt).exp();
+            let fast = ((-damping - frequency) * dt).exp();
+            ((slow + fast) * 0.5, (slow - fast) / (2.0 * frequency))
+        } else {
+            let decay = (-damping * dt).exp();
+            (decay, decay * dt)
+        };
+        Self {
+            position: cosine + damping * sine,
+            velocity: cosine - damping * sine,
+            cross: sine,
+            stiffness_cross: -config.stiffness * sine,
+        }
+    }
+
+    fn apply(&self, spring: &mut Spring, target: f32) {
+        let displacement = spring.value - target;
+        spring.value = target + self.position * displacement + self.cross * spring.velocity;
+        spring.velocity = self.stiffness_cross * displacement + self.velocity * spring.velocity;
+    }
+}
+
+/// Blend premultiplied channels so transparent endpoints don't tint the fade.
 pub(super) fn lerp_hsla(from: Hsla, to: Hsla, t: f32) -> Hsla {
     if t <= 0.0 {
         return from;
@@ -127,11 +182,17 @@ pub(super) fn lerp_hsla(from: Hsla, to: Hsla, t: f32) -> Hsla {
     }
     let a = Rgba::from(from);
     let b = Rgba::from(to);
+    let from_weight = a.a * (1.0 - t);
+    let to_weight = b.a * t;
+    let alpha = from_weight + to_weight;
+    if alpha == 0.0 {
+        return from;
+    }
     Hsla::from(Rgba {
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
-        a: a.a + (b.a - a.a) * t,
+        r: (a.r * from_weight + b.r * to_weight) / alpha,
+        g: (a.g * from_weight + b.g * to_weight) / alpha,
+        b: (a.b * from_weight + b.b * to_weight) / alpha,
+        a: alpha,
     })
 }
 
@@ -182,18 +243,19 @@ impl<const N: usize> MultiSpringState<N> {
         }
         let elapsed = now.saturating_duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
+        let mut step = None;
         let mut active = false;
         for ((spring, previous), target) in self.springs.iter_mut().zip(self.targets).zip(targets) {
             // 上一帧与当前帧之间的时间增量仍属于上一帧的目标值，保持中途改向连续性。
-            let mut moving = spring.step(previous, elapsed, config);
-            if pixel_tolerance.is_some_and(|tolerance| {
-                (spring.value - previous).abs() <= tolerance
-                    && spring.velocity.abs() / 60.0 <= tolerance
-            }) {
-                spring.snap(previous);
-                moving = false;
+            if elapsed > 0.0 && (spring.value != previous || spring.velocity != 0.0) {
+                step.get_or_insert_with(|| SpringStep::new(elapsed, config))
+                    .apply(spring, previous);
             }
-            active |= moving || previous != target;
+            if spring.settled(target, pixel_tolerance) {
+                spring.snap(target);
+            } else {
+                active = true;
+            }
         }
         self.targets = targets;
         (self.springs.map(|spring| spring.value), active)
@@ -206,17 +268,15 @@ pub(super) fn fade_in<E: Styled + IntoElement + 'static>(
     content: E,
 ) -> impl IntoElement {
     let reduced = is_reduced_motion();
-    let start = if reduced { 0.65 } else { 0.45 };
+    let start = if reduced { 0.86 } else { 0.72 };
     let effective = if reduced {
         Duration::from_millis((duration.as_millis() as u64).min(100))
     } else {
         duration
     };
-    content.with_animation(
-        id,
-        Animation::new(effective).with_easing(ease_out_quint()),
-        move |content, progress| content.opacity(start + progress * (1.0 - start)),
-    )
+    timeline(id, effective, move |progress| {
+        content.opacity(start + ease_out_cubic(progress) * (1.0 - start))
+    })
 }
 
 /// 为加载或刷新态图标提供平滑的连续旋转，启用“减少动态效果”时保持静止。
@@ -224,11 +284,10 @@ pub(super) fn spin_svg(id: impl Into<SharedString>, spinning: bool, svg: Svg) ->
     if !spinning || is_reduced_motion() {
         return svg.into_any_element();
     }
-    svg.with_animation(
-        id.into(),
-        Animation::new(Duration::from_millis(900)).repeat(),
-        |el, phase| el.with_transformation(Transformation::rotate(radians(phase * TAU))),
-    )
+    timeline(id.into(), Duration::from_millis(880), move |phase| {
+        svg.with_transformation(Transformation::rotate(radians(phase * TAU)))
+    })
+    .repeat()
     .into_any_element()
 }
 
@@ -238,7 +297,7 @@ pub(super) struct SpringElement<const N: usize> {
     initial: [f32; N],
     targets: [f32; N],
     config: SpringConfig,
-    settle_pixels: bool,
+    pixel_scale: Option<f32>,
     render: Option<Box<dyn FnOnce([f32; N]) -> AnyElement>>,
 }
 
@@ -265,7 +324,7 @@ pub(super) fn spring_from<E: IntoElement + 'static>(
         initial: [initial],
         targets: [target],
         config,
-        settle_pixels: false,
+        pixel_scale: None,
         render: Some(Box::new(move |[value]| render(value).into_any_element())),
     }
 }
@@ -282,7 +341,7 @@ pub(super) fn spring_values<const N: usize, E: IntoElement + 'static>(
         initial: targets,
         targets,
         config,
-        settle_pixels: false,
+        pixel_scale: None,
         render: Some(Box::new(move |values| render(values).into_any_element())),
     }
 }
@@ -295,8 +354,14 @@ pub(super) fn chart_heights<const N: usize, E: IntoElement + 'static>(
 ) -> SpringElement<N> {
     let mut element = spring_values(id, targets, SpringConfig::GENTLE, render);
     element.initial = [0.0; N];
-    element.settle_pixels = true;
-    element
+    element.settle_at_scale(1.0)
+}
+
+impl<const N: usize> SpringElement<N> {
+    pub(super) fn settle_at_scale(mut self, pixels_per_unit: f32) -> Self {
+        self.pixel_scale = Some(pixels_per_unit);
+        self
+    }
 }
 
 impl<const N: usize> IntoElement for SpringElement<N> {
@@ -329,22 +394,30 @@ impl<const N: usize> Element for SpringElement<N> {
         let initial = self.initial;
         let targets = self.targets;
         let config = self.config;
-        let pixel_tolerance = self.settle_pixels.then(|| 0.5 / window.scale_factor());
+        let pixel_tolerance = self
+            .pixel_scale
+            .map(|scale| 0.5 / (window.scale_factor() * scale));
         let snap_immediately = is_reduced_motion();
         let (values, active) = window.with_element_state(
             global_id.unwrap(),
-            |state: Option<MultiSpringState<N>>, _| {
-                let now = Instant::now();
+            |state: Option<MultiSpringState<N>>, window| {
+                let now = frame_time(window);
                 let mut state =
                     state.unwrap_or_else(|| MultiSpringState::new(initial, targets, now));
                 (
-                    state.advance_with_policy(targets, now, config, pixel_tolerance, snap_immediately),
+                    state.advance_with_policy(
+                        targets,
+                        now,
+                        config,
+                        pixel_tolerance,
+                        snap_immediately,
+                    ),
                     state,
                 )
             },
         );
         if active {
-            window.request_animation_frame();
+            request_frame(window);
         }
         let mut element = (self.render.take().expect("render called once"))(values);
         let layout_id = element.request_layout(window, cx);
@@ -400,6 +473,20 @@ impl SlideOffset {
             Self::WindowRight => point(viewport_width - bounds.left() + px(16.0), px(0.0)),
         }
     }
+
+    fn displacement(
+        &self,
+        bounds: Bounds<Pixels>,
+        viewport_width: Pixels,
+        remaining: f32,
+    ) -> Point<Pixels> {
+        let mut offset = self.resolve(bounds, viewport_width) * remaining;
+        if matches!(self, Self::WindowRight) && remaining < 0.0 {
+            // The rebound should feel the same even if the drawer is much wider.
+            offset.x /= 1.0 + offset.x.abs() / px(6.0);
+        }
+        offset
+    }
 }
 
 /// 为任意 `Styled` 元素附加可双向打断的位移 + 淡入淡出过渡。
@@ -432,7 +519,7 @@ pub(super) fn slide_fade_from_right<E: Styled + IntoElement + 'static>(
     let (target, config) = if exiting {
         (0.0, SpringConfig::EXIT)
     } else {
-        (1.0, SpringConfig::SNAPPY)
+        (1.0, SpringConfig::DRAWER)
     };
     SlideFadeElement {
         id: id.into(),
@@ -479,18 +566,27 @@ impl<E: Styled + IntoElement + 'static> Element for SlideFadeElement<E> {
         let reduced = is_reduced_motion();
         let initial = self.initial;
         let target = self.target;
-        let config = if reduced { SpringConfig::EXIT } else { self.config };
+        let config = if reduced {
+            SpringConfig::EXIT
+        } else {
+            self.config
+        };
+        let distance = match &self.offset {
+            SlideOffset::Fixed(offset) => f32::from(offset.x.abs().max(offset.y.abs())),
+            SlideOffset::WindowRight => f32::from(window.viewport_size().width),
+        };
+        let tolerance = 0.5 / (window.scale_factor() * distance.max(128.0));
         let ([progress], active) = window.with_element_state(
             global_id.unwrap(),
-            |state: Option<MultiSpringState<1>>, _| {
-                let now = Instant::now();
+            |state: Option<MultiSpringState<1>>, window| {
+                let now = frame_time(window);
                 let mut state =
                     state.unwrap_or_else(|| MultiSpringState::new([initial], [target], now));
-                (state.advance([target], now, config, None), state)
+                (state.advance([target], now, config, Some(tolerance)), state)
             },
         );
         if active {
-            window.request_animation_frame();
+            request_frame(window);
         }
         let child = self.child.take().expect("child taken once");
         let mut element = child.opacity(progress.clamp(0.0, 1.0)).into_any_element();
@@ -508,9 +604,11 @@ impl<E: Styled + IntoElement + 'static> Element for SlideFadeElement<E> {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let offset = self.offset.resolve(bounds, window.viewport_size().width) * state.remaining;
+        let offset =
+            self.offset
+                .displacement(bounds, window.viewport_size().width, state.remaining);
         window.with_element_offset(offset, |window| {
-            state.element.prepaint(window, cx);
+            layout::with_slide_offset(offset, || state.element.prepaint(window, cx));
         });
     }
 
@@ -550,13 +648,8 @@ pub(super) struct SlidingTrackStyle {
 }
 
 struct SlidingTrackState {
-    x: Spring,
-    y: Spring,
-    w: Spring,
-    h: Spring,
-    alpha: Spring,
-    initialized: bool,
-    last_frame: Instant,
+    geometry: Option<MultiSpringState<4>>,
+    opacity: MultiSpringState<1>,
 }
 
 pub(super) struct SlidingTrackLayout {
@@ -660,78 +753,58 @@ impl Element for SlidingTrack {
             .and_then(|idx| layout.child_layout_ids.get(idx).copied())
             .map(|lid| {
                 let b = window.layout_bounds(lid);
-                (
+                [
                     f32::from(b.origin.x - bounds.origin.x),
                     f32::from(b.origin.y - bounds.origin.y),
                     f32::from(b.size.width),
                     f32::from(b.size.height),
-                )
+                ]
             });
 
-        let (pill_bounds, alpha, active) = window.with_element_state(
-            global_id.unwrap(),
-            |state: Option<SlidingTrackState>, _| {
-                let now = Instant::now();
+        let now = frame_time(window);
+        let tolerance = 0.5 / window.scale_factor();
+        let reduced = is_reduced_motion();
+        let (pill_bounds, alpha, active) =
+            window.with_element_state(global_id.unwrap(), |state: Option<SlidingTrackState>, _| {
+                let opacity_target = [f32::from(target_rect.is_some())];
                 let mut state = state.unwrap_or_else(|| SlidingTrackState {
-                    x: Spring::new(0.0),
-                    y: Spring::new(0.0),
-                    w: Spring::new(0.0),
-                    h: Spring::new(0.0),
-                    alpha: Spring::new(if target_rect.is_some() { 1.0 } else { 0.0 }),
-                    initialized: false,
-                    last_frame: now,
+                    geometry: None,
+                    opacity: MultiSpringState::new(opacity_target, opacity_target, now),
                 });
-                let dt = now.saturating_duration_since(state.last_frame).as_secs_f32();
-                state.last_frame = now;
-
-                let reduced = is_reduced_motion();
-                let mut active = false;
-                if let Some((tx, ty, tw, th)) = target_rect {
-                    if reduced {
-                        state.x.snap(tx);
-                        state.y.snap(ty);
-                        state.w.snap(tw);
-                        state.h.snap(th);
-                        state.alpha.snap(1.0);
-                        state.initialized = true;
-                    } else if !state.initialized || state.alpha.value <= 0.01 {
-                        state.x.snap(tx);
-                        state.y.snap(ty);
-                        state.w.snap(tw);
-                        state.h.snap(th);
-                        if !state.initialized {
-                            state.alpha.snap(1.0);
-                            state.initialized = true;
-                        } else {
-                            active |= state.alpha.step(1.0, dt, SpringConfig::SNAPPY);
-                        }
-                    } else {
-                        active |= state.x.step(tx, dt, SpringConfig::SNAPPY);
-                        active |= state.y.step(ty, dt, SpringConfig::SNAPPY);
-                        active |= state.w.step(tw, dt, SpringConfig::SNAPPY);
-                        active |= state.h.step(th, dt, SpringConfig::SNAPPY);
-                        active |= state.alpha.step(1.0, dt, SpringConfig::SNAPPY);
-                    }
-                } else if reduced {
-                    state.alpha.snap(0.0);
-                } else {
-                    active |= state.alpha.step(0.0, dt, SpringConfig::SNAPPY);
+                let ([alpha], mut active) = state.opacity.advance_with_policy(
+                    opacity_target,
+                    now,
+                    SpringConfig::FEEDBACK,
+                    Some(0.006),
+                    reduced,
+                );
+                let alpha = alpha.clamp(0.0, 1.0);
+                if let Some(target) = target_rect {
+                    state
+                        .geometry
+                        .get_or_insert_with(|| MultiSpringState::new(target, target, now));
+                } else if alpha == 0.0 {
+                    state.geometry = None;
                 }
-
-                let alpha = state.alpha.value.clamp(0.0, 1.0);
-                let rect = (state.initialized && alpha > 0.005 && state.w.value > 0.5 && state.h.value > 0.5)
-                    .then(|| {
-                        Bounds::new(
-                            bounds.origin + point(px(state.x.value), px(state.y.value)),
-                            size(px(state.w.value.max(0.0)), px(state.h.value.max(0.0))),
-                        )
-                    });
+                let rect = state.geometry.as_mut().and_then(|geometry| {
+                    let target = target_rect.unwrap_or_else(|| geometry.targets());
+                    let ([x, y, w, h], moving) = geometry.advance_with_policy(
+                        target,
+                        now,
+                        SpringConfig::SNAPPY,
+                        Some(tolerance),
+                        reduced,
+                    );
+                    active |= moving;
+                    (alpha > 0.0 && w > 0.0 && h > 0.0).then(|| {
+                        Bounds::new(bounds.origin + point(px(x), px(y)), size(px(w), px(h)))
+                    })
+                });
                 ((rect, alpha, active), state)
-            },
-        );
+            });
 
         if active {
-            window.request_animation_frame();
+            request_frame(window);
         }
         for child in &mut self.children {
             child.prepaint(window, cx);
@@ -837,11 +910,37 @@ mod tests {
     }
 
     #[test]
-    fn spring_clamps_large_frame_hitches() {
+    fn spring_uses_elapsed_time_across_refresh_rates_and_frame_hitches() {
         let mut spring = Spring::new(0.0);
         spring.step(1.0, 5.0, SpringConfig::SNAPPY);
-        assert!(spring.value.is_finite());
-        assert!(spring.value >= 0.0 && spring.value < 1.25);
+        assert_eq!((spring.value, spring.velocity), (1.0, 0.0));
+
+        for config in [
+            SpringConfig::DRAWER,
+            SpringConfig::SMOOTH,
+            SpringConfig {
+                stiffness: 256.0,
+                damping: 48.0,
+            },
+        ] {
+            let mut uninterrupted = Spring {
+                value: -1.0,
+                velocity: 12.0,
+            };
+            SpringStep::new(0.125, config).apply(&mut uninterrupted, 1.0);
+            for frames in [4, 8, 16] {
+                let mut sampled = Spring {
+                    value: -1.0,
+                    velocity: 12.0,
+                };
+                let step = SpringStep::new(0.125 / frames as f32, config);
+                for _ in 0..frames {
+                    step.apply(&mut sampled, 1.0);
+                }
+                assert!((sampled.value - uninterrupted.value).abs() < 0.00001);
+                assert!((sampled.velocity - uninterrupted.velocity).abs() < 0.0001);
+            }
+        }
     }
 
     #[test]
@@ -875,7 +974,7 @@ mod tests {
             );
             if !active {
                 assert_eq!(height, 146.0);
-                assert!(frame >= 30);
+                assert!((18..=32).contains(&frame));
                 return;
             }
         }
@@ -915,6 +1014,17 @@ mod tests {
     }
 
     #[test]
+    fn transparent_fills_keep_their_visible_hue() {
+        let solid: Hsla = rgb(0xe8edff).into();
+        let mid = Rgba::from(lerp_hsla(Hsla::default().opacity(0.0), solid, 0.5));
+        let solid = Rgba::from(solid);
+        assert!((mid.a - 0.5).abs() < 0.001);
+        assert!((mid.r - solid.r).abs() < 0.001);
+        assert!((mid.g - solid.g).abs() < 0.001);
+        assert!((mid.b - solid.b).abs() < 0.001);
+    }
+
+    #[test]
     fn exit_spring_settles_before_unmount_deadline() {
         let mut spring = Spring::new(1.0);
         let frames = (EXIT_DURATION.as_secs_f32() * 60.0).floor() as usize;
@@ -951,6 +1061,8 @@ mod tests {
                     peak = peak.max(spring.value);
                 }
                 assert!((px(2.0)..px(12.0)).contains(&(travel.x * (peak - 1.0))));
+                let rebound = enter.offset.displacement(bounds, window_right, 1.0 - peak);
+                assert!((px(-6.0)..px(0.0)).contains(&rebound.x));
                 assert_eq!(spring.value, enter.target);
 
                 // 首帧收到关闭目标，余下帧完成位移。

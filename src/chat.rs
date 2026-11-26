@@ -6,14 +6,14 @@ use crate::messages::{
     title_for, upstream_prompt_override, uuid_v4,
 };
 use crate::qbs::{self, SpentAllowance};
-use crate::threads::{ThreadEntry, ThreadStore, digest, message_key};
+use crate::threads::{ThreadHistory, ThreadMatch, ThreadStore, digest};
 use crate::toolbridge::{
     BridgeStream, TOOL_DETAILS, TOOL_REMINDER, ToolCallReply, ToolDetail, build_tool_bridge_prompt,
     parse_client_tool_calls, parse_tool_choice, requested_tool_names,
 };
 use crate::upstream::{
-    TurnInput, UpstreamError, UpstreamErrorKind, UpstreamEvent, UpstreamSession, UpstreamUsage,
-    chat, frame_bytes, user_message,
+    ContextUsage, TurnInput, UpstreamError, UpstreamErrorKind, UpstreamEvent, UpstreamSession,
+    UpstreamUsage, chat, frame_bytes, user_message, wait_for_cancellation,
 };
 use anyhow::{Result, bail};
 use base64::Engine;
@@ -54,20 +54,22 @@ pub struct NormalizedUsage {
     pub total_tokens: u64,
     pub cached_tokens: u64,
     pub resolved_model_id: String,
+    pub context: Option<ContextUsage>,
 }
 
 impl NormalizedUsage {
     pub fn from_upstream(u: &UpstreamUsage) -> Self {
         let completion = u.completion;
+        let input = u.prompt.saturating_add(u.cache_read).saturating_add(u.cache_write);
         let total = if u.total > 0 {
             u.total
         } else {
-            u.prompt + u.cache_read + u.cache_write + completion
+            input.saturating_add(completion)
         };
         let prompt = if total >= completion {
             total - completion
         } else {
-            u.prompt + u.cache_read + u.cache_write
+            input
         };
         Self {
             prompt_tokens: prompt,
@@ -75,6 +77,7 @@ impl NormalizedUsage {
             total_tokens: total,
             cached_tokens: u.cache_read,
             resolved_model_id: u.resolved_model_id.clone(),
+            context: u.context,
         }
     }
 
@@ -102,6 +105,24 @@ pub struct ChatFailure {
     pub message: String,
     pub sign_in_expired: bool,
     pub retry_after_secs: Option<u64>,
+    pub(crate) reported_usage: Option<NormalizedUsage>,
+}
+
+impl ChatFailure {
+    pub(crate) fn incomplete() -> Self {
+        Self {
+            status: 502,
+            code: "upstream_error".into(),
+            message: "Amazon Quick ended the stream before completing the reply".into(),
+            sign_in_expired: false,
+            retry_after_secs: None,
+            reported_usage: None,
+        }
+    }
+
+    pub(crate) fn confirmed_quota(&self) -> bool {
+        self.code == "insufficient_quota"
+    }
 }
 
 pub fn is_refused(err: &UpstreamError) -> bool {
@@ -118,6 +139,10 @@ fn format_span(secs: u64) -> String {
 }
 
 pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -> ChatFailure {
+    let reported_usage = err
+        .reported_usage
+        .as_deref()
+        .map(NormalizedUsage::from_upstream);
     if let Some(sp) = spent {
         if is_refused(err) {
             let back = if sp.secs > 0 {
@@ -138,6 +163,7 @@ pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -
                 } else {
                     None
                 },
+                reported_usage,
             };
         }
     }
@@ -148,12 +174,29 @@ pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -
     });
 
     match err.kind {
+        UpstreamErrorKind::Quota => ChatFailure {
+            status: 429,
+            code: "insufficient_quota".to_string(),
+            message: err.message.clone(),
+            sign_in_expired: false,
+            retry_after_secs: Some(300),
+            reported_usage,
+        },
+        UpstreamErrorKind::Cancelled => ChatFailure {
+            status: 499,
+            code: "request_cancelled".to_string(),
+            message: err.message.clone(),
+            sign_in_expired: false,
+            retry_after_secs: None,
+            reported_usage,
+        },
         UpstreamErrorKind::Handshake if err.status == 401 => ChatFailure {
             status: 401,
             code: "upstream_session_unavailable".to_string(),
             message: format!("Amazon Quick refused the sign-in; sign in again ({})", err.message),
             sign_in_expired: true,
             retry_after_secs: None,
+            reported_usage,
         },
         UpstreamErrorKind::Handshake if err.status == 403 => ChatFailure {
             status: 403,
@@ -161,6 +204,7 @@ pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -
             message: err.message.clone(),
             sign_in_expired: false,
             retry_after_secs: None,
+            reported_usage,
         },
         UpstreamErrorKind::Handshake if err.status == 429 => ChatFailure {
             status: 429,
@@ -168,6 +212,7 @@ pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -
             message: err.message.clone(),
             sign_in_expired: false,
             retry_after_secs: Some(60),
+            reported_usage,
         },
         UpstreamErrorKind::Timeout => ChatFailure {
             status: 504,
@@ -175,6 +220,7 @@ pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -
             message: err.message.clone(),
             sign_in_expired: false,
             retry_after_secs: None,
+            reported_usage,
         },
         UpstreamErrorKind::TooLarge => ChatFailure {
             status: 400,
@@ -185,6 +231,7 @@ pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -
             ),
             sign_in_expired: false,
             retry_after_secs: None,
+            reported_usage,
         },
         UpstreamErrorKind::Blocked => ChatFailure {
             status: 400,
@@ -192,6 +239,7 @@ pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -
             message: err.message.clone(),
             sign_in_expired: false,
             retry_after_secs: None,
+            reported_usage,
         },
         UpstreamErrorKind::Upstream if throttled.is_match(&err.message) => ChatFailure {
             status: 429,
@@ -199,6 +247,7 @@ pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -
             message: err.message.clone(),
             sign_in_expired: false,
             retry_after_secs: Some(60),
+            reported_usage,
         },
         _ => ChatFailure {
             status: 502,
@@ -206,6 +255,7 @@ pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -
             message: err.message.clone(),
             sign_in_expired: false,
             retry_after_secs: None,
+            reported_usage,
         },
     }
 }
@@ -405,16 +455,16 @@ pub struct ComposedTurn {
     pub custom_digest: String,
 }
 
-pub async fn compose(
+async fn compose(
     turn: &PreparedTurn,
     auth: &AccountRecord,
     cfg: &Settings,
     session: &UpstreamSession,
-    thread: Option<&ThreadEntry>,
+    thread: Option<&ThreadMatch>,
     thread_id: &str,
 ) -> Result<ComposedTurn, UpstreamError> {
     let mut images: Vec<InlineImage> = Vec::new();
-    let fresh_start = thread.map(|t| t.keys.len()).unwrap_or(0);
+    let fresh_start = thread.map(|t| t.from).unwrap_or(0);
     let fresh = &turn.convo[fresh_start.min(turn.convo.len())..];
     let mut blocks = prompt_blocks(
         fresh,
@@ -581,7 +631,7 @@ pub enum TurnEvent {
     Text(String),
     Tool(ToolCallReply),
     Done(NormalizedUsage),
-    Error(String),
+    Error(ChatFailure),
 }
 
 #[derive(Debug, Clone)]
@@ -609,36 +659,36 @@ pub enum ChatOutput {
 }
 
 /// 使用选定账号执行单轮对话，支持 `threads` 线程复用、`0.7x` 帧超限重试与过期线程回退。
-pub async fn run_turn_for_account(
-    turn: PreparedTurn,
+pub(crate) async fn run_turn_for_account(
+    turn: Arc<PreparedTurn>,
     auth: AccountRecord,
     cfg: Settings,
-    conversation: String,
+    history: Option<Arc<ThreadHistory>>,
     threads: Arc<Mutex<ThreadStore>>,
     cancel_rx: watch::Receiver<bool>,
 ) -> Result<ChatOutput, ChatFailure> {
     let session = UpstreamSession::from_auth(&auth, &cfg);
 
-    let account_key = auth.key();
-    let keys: Vec<String> = turn.convo.iter().map(message_key).collect();
+    let account = digest(&auth.key());
+    let matched_thread = history
+        .as_ref()
+        .and_then(|history| threads.lock().match_thread(&account, history));
 
-    let matched_thread = if cfg.stateful {
-        threads.lock().match_thread(&account_key, &conversation, &keys)
-    } else {
-        None
-    };
-
-    let attempt_run = async |thread: Option<ThreadEntry>| -> Result<ChatOutput, UpstreamError> {
+    let attempt_run = async |thread: Option<ThreadMatch>| -> Result<ChatOutput, UpstreamError> {
         let thread_id = thread
             .as_ref()
             .map(|t| t.id.clone())
             .unwrap_or_else(uuid_v4);
-        let composed = match compose(&turn, &auth, &cfg, &session, thread.as_ref(), &thread_id).await
-        {
+        let mut prepare_cancel = cancel_rx.clone();
+        let composed = tokio::select! {
+            _ = wait_for_cancellation(&mut prepare_cancel) => Err(UpstreamError::cancelled()),
+            composed = compose(&turn, &auth, &cfg, &session, thread.as_ref(), &thread_id) => composed,
+        };
+        let mut composed = match composed {
             Ok(c) => c,
             Err(e) => {
                 if let Some(t) = &thread {
-                    threads.lock().drop_thread(&t.id);
+                    threads.lock().release(&t.id);
                 }
                 return Err(e);
             }
@@ -655,9 +705,17 @@ pub async fn run_turn_for_account(
                     if let Ok(recomposed) =
                         compose(&turn, &auth, &smaller, &session, thread.as_ref(), &thread_id).await
                     {
+                        composed = recomposed;
                         let (ev_tx2, ev_rx2) = mpsc::unbounded_channel();
                         ev_rx = ev_rx2;
-                        res = chat(&session, &smaller, &recomposed.input, cancel_rx.clone(), Some(ev_tx2)).await;
+                        res = chat(
+                            &session,
+                            &smaller,
+                            &composed.input,
+                            cancel_rx.clone(),
+                            Some(ev_tx2),
+                        )
+                        .await;
                     }
                 }
             }
@@ -665,22 +723,10 @@ pub async fn run_turn_for_account(
             let res = match res {
                 Ok(r) => r,
                 Err(e) => {
-                    if let Some(t) = &thread {
-                        threads.lock().drop_thread(&t.id);
-                    }
+                    finish_failed_thread(&threads, thread, &e).await;
                     return Err(e);
                 }
             };
-
-            if cfg.stateful {
-                threads.lock().commit(
-                    thread_id,
-                    account_key.clone(),
-                    conversation.clone(),
-                    composed.custom_digest,
-                    &keys,
-                );
-            }
 
             let mut reasoning = String::new();
             while let Ok(ev) = ev_rx.try_recv() {
@@ -698,11 +744,26 @@ pub async fn run_turn_for_account(
                 calls.truncate(1);
             }
             if text.trim().is_empty() && calls.is_empty() {
-                return Err(UpstreamError::new(
+                let e = UpstreamError::new(
                     UpstreamErrorKind::Upstream,
                     "upstream returned no text or tool calls",
                     502,
-                ));
+                )
+                .with_reported_usage(res.usage);
+                finish_failed_thread(&threads, thread, &e).await;
+                return Err(e);
+            }
+            if let Some(history) = &history {
+                ThreadStore::remember(
+                    threads.clone(),
+                    history,
+                    thread_id,
+                    account.clone(),
+                    composed.custom_digest,
+                    &text,
+                    &calls,
+                )
+                .await;
             }
             return Ok(ChatOutput::Completed(CompletedTurn {
                 id: turn.id.clone(),
@@ -731,9 +792,8 @@ pub async fn run_turn_for_account(
         let sess_owned = session.clone();
         let cfg_owned = cfg.clone();
         let threads_owned = threads.clone();
-        let account_key_owned = account_key.clone();
-        let conv_owned = conversation.clone();
-        let keys_owned = keys.clone();
+        let account_owned = account.clone();
+        let history_owned = history.clone();
         let cancel_owned = cancel_rx.clone();
 
         tokio::spawn(async move {
@@ -747,7 +807,7 @@ pub async fn run_turn_for_account(
                 } else {
                     None
                 };
-                let mut saw_text = false;
+                let mut reply = String::new();
                 let mut signaled = false;
 
                 let wait_fut = async {
@@ -783,7 +843,7 @@ pub async fn run_turn_for_account(
                                     if t.is_empty() { continue; }
                                     if let Some(b) = bridge.as_mut() {
                                         if let Some(ready) = b.push(&t) {
-                                            saw_text = true;
+                                            reply.push_str(&ready);
                                             if !signaled {
                                                 signaled = true;
                                                 if let Some(tx) = first_tx.take() { let _ = tx.send(Ok(())); }
@@ -791,7 +851,7 @@ pub async fn run_turn_for_account(
                                             let _ = out_tx_stream.send(TurnEvent::Text(ready));
                                         }
                                     } else {
-                                        saw_text = true;
+                                        reply.push_str(&t);
                                         if !signaled {
                                             signaled = true;
                                             if let Some(tx) = first_tx.take() { let _ = tx.send(Ok(())); }
@@ -804,34 +864,28 @@ pub async fn run_turn_for_account(
                         }
                     }
                 }
-                (bridge, saw_text, signaled, first_tx)
+                (bridge, reply, signaled, first_tx)
             });
 
             let res =
                 chat(&sess_owned, &cfg_owned, &composed.input, cancel_owned.clone(), Some(ev_tx))
                     .await;
 
-            let Ok((mut bridge, mut saw_text, signaled, mut first_tx)) = bridge_task.await else {
+            let Ok((mut bridge, mut reply, signaled, mut first_tx)) = bridge_task.await else {
+                if let Some(t) = &thread {
+                    ThreadStore::discard(threads_owned, t.id.clone()).await;
+                }
                 return;
             };
 
             match res {
                 Ok(up_res) => {
-                    if cfg_owned.stateful {
-                        threads_owned.lock().commit(
-                            thread_id,
-                            account_key_owned,
-                            conv_owned,
-                            composed.custom_digest,
-                            &keys_owned,
-                        );
-                    }
                     let mut calls = Vec::new();
                     if let Some(b) = bridge.as_mut() {
                         let (tail, c) = b.finish();
                         if let Some(t) = tail {
                             if !t.is_empty() {
-                                saw_text = true;
+                                reply.push_str(&t);
                                 if let Some(tx) = first_tx.take() {
                                     let _ = tx.send(Ok(()));
                                 }
@@ -843,23 +897,37 @@ pub async fn run_turn_for_account(
                     if !parallel && calls.len() > 1 {
                         calls.truncate(1);
                     }
-                    if !saw_text && calls.is_empty() {
+                    if reply.is_empty() && calls.is_empty() {
                         let err = UpstreamError::new(
                             UpstreamErrorKind::Upstream,
                             "upstream returned no text or tool calls",
                             502,
-                        );
+                        )
+                        .with_reported_usage(up_res.usage);
+                        finish_failed_thread(&threads_owned, thread, &err).await;
                         if !signaled {
                             if let Some(tx) = first_tx.take() {
                                 let _ = tx.send(Err(err));
                             }
                         } else {
-                            let _ = out_tx.send(TurnEvent::Error(err.message));
+                            let _ = out_tx.send(TurnEvent::Error(failure_from_error(&err, None)));
                         }
                         return;
                     }
                     if let Some(tx) = first_tx.take() {
                         let _ = tx.send(Ok(()));
+                    }
+                    if let Some(history) = &history_owned {
+                        ThreadStore::remember(
+                            threads_owned,
+                            history,
+                            thread_id,
+                            account_owned,
+                            composed.custom_digest,
+                            &reply,
+                            &calls,
+                        )
+                        .await;
                     }
                     for call in calls {
                         let _ = out_tx.send(TurnEvent::Tool(call));
@@ -869,15 +937,13 @@ pub async fn run_turn_for_account(
                     )));
                 }
                 Err(e) => {
-                    if let Some(t) = &thread {
-                        threads_owned.lock().drop_thread(&t.id);
-                    }
+                    finish_failed_thread(&threads_owned, thread, &e).await;
                     if !signaled {
                         if let Some(tx) = first_tx.take() {
                             let _ = tx.send(Err(e));
                         }
                     } else {
-                        let _ = out_tx.send(TurnEvent::Error(e.message));
+                        let _ = out_tx.send(TurnEvent::Error(failure_from_error(&e, None)));
                     }
                 }
             }
@@ -906,7 +972,11 @@ pub async fn run_turn_for_account(
         Err(e) => {
             if matched_thread.is_some()
                 && !*cancel_rx.borrow()
-                && e.kind != UpstreamErrorKind::Handshake
+                && matches!(
+                    e.kind,
+                    UpstreamErrorKind::Upstream | UpstreamErrorKind::Transport
+                )
+                && failure_from_error(&e, None).status != 429
             {
                 attempt_run(None).await
             } else {
@@ -919,11 +989,37 @@ pub async fn run_turn_for_account(
         Ok(out) => Ok(out),
         Err(e) => {
             let spent = if is_refused(&e) {
-                qbs::spent(&auth, &cfg).await
+                let mut cancel_rx = cancel_rx;
+                tokio::select! {
+                    _ = wait_for_cancellation(&mut cancel_rx) => {
+                        return Err(failure_from_error(&UpstreamError::cancelled(), None));
+                    }
+                    spent = qbs::spent(&auth, &cfg) => spent,
+                }
             } else {
                 None
             };
             Err(failure_from_error(&e, spent.as_ref()))
         }
+    }
+}
+
+async fn finish_failed_thread(
+    threads: &Arc<Mutex<ThreadStore>>,
+    thread: Option<ThreadMatch>,
+    err: &UpstreamError,
+) {
+    let Some(thread) = thread else { return };
+    if matches!(
+        err.kind,
+        UpstreamErrorKind::Cancelled
+            | UpstreamErrorKind::Quota
+            | UpstreamErrorKind::Handshake
+            | UpstreamErrorKind::Blocked
+            | UpstreamErrorKind::TooLarge
+    ) {
+        threads.lock().release(&thread.id);
+    } else {
+        ThreadStore::discard(threads.clone(), thread.id).await;
     }
 }

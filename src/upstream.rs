@@ -11,8 +11,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -33,6 +34,8 @@ const STOP_SETTLE_MS: u64 = 3_000;
 pub enum UpstreamErrorKind {
     Handshake,
     Upstream,
+    Quota,
+    Cancelled,
     TooLarge,
     Blocked,
     Timeout,
@@ -45,6 +48,7 @@ pub struct UpstreamError {
     pub kind: UpstreamErrorKind,
     pub message: String,
     pub status: u16,
+    pub(crate) reported_usage: Option<Box<UpstreamUsage>>,
 }
 
 impl UpstreamError {
@@ -53,7 +57,31 @@ impl UpstreamError {
             kind,
             message: message.into(),
             status,
+            reported_usage: None,
         }
+    }
+
+    pub(crate) fn cancelled() -> Self {
+        Self::new(
+            UpstreamErrorKind::Cancelled,
+            "The client cancelled the request",
+            499,
+        )
+    }
+
+    fn quota() -> Self {
+        Self::new(
+            UpstreamErrorKind::Quota,
+            "Amazon Quick's allowance is used up",
+            429,
+        )
+    }
+
+    pub(crate) fn with_reported_usage(mut self, usage: UpstreamUsage) -> Self {
+        if usage.context.is_some() {
+            self.reported_usage = Some(Box::new(usage));
+        }
+        self
     }
 }
 
@@ -116,6 +144,100 @@ pub struct UpstreamUsage {
     pub cache_read: u64,
     pub cache_write: u64,
     pub resolved_model_id: String,
+    pub context: Option<ContextUsage>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContextUsage {
+    pub used_tokens: Option<u64>,
+    pub window_tokens: Option<NonZeroU64>,
+}
+
+impl UpstreamUsage {
+    fn record(&mut self, event: &Map<String, Value>) {
+        let count = |key: &str| event.get(key).and_then(Value::as_u64);
+        let input = count("input_tokens");
+        let cache_read = count("cache_read_tokens");
+        let cache_write = count("cache_write_tokens");
+        let output = count("output_tokens");
+        let window_tokens = count("context_window")
+            .and_then(NonZeroU64::new)
+            .or_else(|| count("contextWindow").and_then(NonZeroU64::new));
+        let uncached = input.unwrap_or(0);
+        let read = cache_read.unwrap_or(0);
+        let write = cache_write.unwrap_or(0);
+        let known_input = uncached
+            .checked_add(read)
+            .and_then(|total| total.checked_add(write));
+        let used_tokens = if input.is_some() && cache_read.is_some() && cache_write.is_some() {
+            known_input
+        } else {
+            count("total_tokens")
+                .zip(output)
+                .and_then(|(total, output)| total.checked_sub(output))
+                .filter(|&used| known_input.is_some_and(|known| used >= known))
+        };
+
+        if let Some(model) = ["resolved_model_id", "served_model_id"]
+            .into_iter()
+            .filter_map(|key| event.get(key)?.as_str())
+            .find(|model| !model.is_empty())
+        {
+            if !self.resolved_model_id.is_empty() && self.resolved_model_id != model {
+                self.context = None;
+            }
+            self.resolved_model_id = model.to_owned();
+        }
+        // The input and the window belong to the same reported model step.
+        // Output-only updates must not replace the measured input.
+        if used_tokens.is_some() || (window_tokens.is_some() && self.context.is_none()) {
+            self.context = Some(ContextUsage {
+                used_tokens,
+                window_tokens,
+            });
+        }
+
+        if uncached > 0 || read > 0 || write > 0 {
+            self.prompt = uncached;
+            self.cache_read = read;
+            self.cache_write = write;
+        }
+        self.completion = self.completion.saturating_add(output.unwrap_or(0));
+        self.total = self
+            .prompt
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+            .saturating_add(self.completion);
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn context_follows_the_latest_measured_input_and_window() {
+        let mut usage = UpstreamUsage::default();
+        let mut record = |event: Value| {
+            usage.record(event.as_object().unwrap());
+            usage.context
+        };
+        assert_eq!(record(json!({"output_tokens": 3})), None);
+        let first = record(json!({
+            "total_tokens": 120, "output_tokens": 20,
+            "context_window": 320_000, "resolved_model_id": "first"
+        })).unwrap();
+        assert_eq!(first.used_tokens, Some(100));
+        assert_eq!(first.window_tokens.map(NonZeroU64::get), Some(320_000));
+        assert_eq!(record(json!({"output_tokens": 7})), Some(first));
+
+        let second = record(json!({
+            "input_tokens": 90, "cache_read_tokens": 0, "cache_write_tokens": 10,
+            "context_window": 0, "served_model_id": "second"
+        })).unwrap();
+        assert_eq!(second.used_tokens, Some(100));
+        assert_eq!(second.window_tokens, None);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -480,12 +602,89 @@ fn is_terminal(t: &str) -> bool {
 }
 
 fn is_failure(t: &str) -> bool {
-    matches!(t, "error" | "session_error" | "stream_error" | "turn_failed")
+    matches!(
+        t,
+        "error" | "session_error" | "stream_error" | "turn_failed" | "stream_truncated"
+    )
+}
+
+const QUOTA_NOTICES: &[&str] = &[
+    "you've reached your usage limit. check your profile for details.",
+    "you have reached your usage limit. check your profile for details.",
+];
+
+fn quota_notice_text(text: &str) -> String {
+    text.replace(['‘', '’'], "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn is_quota_notice(text: &str) -> bool {
+    let text = quota_notice_text(text);
+    QUOTA_NOTICES
+        .iter()
+        .any(|notice| text == *notice || notice.strip_suffix('.') == Some(text.as_str()))
+}
+
+fn is_quota_error(envelope: &Value) -> bool {
+    [&envelope["payload"], envelope].iter().any(|value| {
+        [
+            "error_type",
+            "errorType",
+            "failure_type",
+            "failureType",
+            "code",
+            "reason",
+            "error",
+            "type",
+        ]
+        .iter()
+        .any(|key| value[key].as_str() == Some("usage_limit"))
+    })
+}
+
+fn push_reply_text(
+    text: &mut String,
+    pending: &mut bool,
+    delta: String,
+    emit: &impl Fn(UpstreamEvent),
+) {
+    if delta.is_empty() {
+        return;
+    }
+    text.push_str(&delta);
+    if *pending {
+        // Quick may return a quota error as an entire assistant message. Hold
+        // only its possible prefix, and release it as soon as the reply differs.
+        if text.len() <= 256 {
+            let prefix = quota_notice_text(text);
+            if QUOTA_NOTICES
+                .iter()
+                .any(|notice| notice.starts_with(&prefix))
+            {
+                return;
+            }
+        }
+        *pending = false;
+        emit(UpstreamEvent::Text(text.clone()));
+    } else {
+        emit(UpstreamEvent::Text(delta));
+    }
 }
 
 struct ChunkEntry {
     parts: Vec<Option<String>>,
     have: usize,
+}
+
+pub(crate) async fn wait_for_cancellation(cancel: &mut watch::Receiver<bool>) {
+    let closed = cancel.wait_for(|&cancelled| cancelled).await.is_err();
+    if closed {
+        // A dropped sender with a false value is not a cancellation.
+        std::future::pending::<()>().await;
+    }
 }
 
 /// 通过 WebSocket 向 Amazon Quick 发送一轮对话并收集流式事件与用量。
@@ -507,14 +706,6 @@ pub async fn chat(
     } else {
         input.title.trim().to_string()
     };
-
-    if *cancel_rx.borrow() {
-        return Err(UpstreamError::new(
-            UpstreamErrorKind::Transport,
-            "The request was aborted",
-            0,
-        ));
-    }
 
     let proxy = proxy_for(&dial.url, cfg);
     let mut ws_req = dial.url.as_str().into_client_request().map_err(|e| {
@@ -548,15 +739,20 @@ pub async fn chat(
         Ok::<_, UpstreamError>(ws)
     };
 
-    let mut ws = tokio::time::timeout(Duration::from_secs(HANDSHAKE_SECS), connect_fut)
-        .await
-        .map_err(|_| {
-            UpstreamError::new(
-                UpstreamErrorKind::Timeout,
-                "upstream WebSocket handshake timed out",
-                0,
-            )
-        })??;
+    let connected = tokio::select! {
+        biased;
+        _ = wait_for_cancellation(&mut cancel_rx) => {
+            return Err(UpstreamError::cancelled());
+        }
+        result = tokio::time::timeout(Duration::from_secs(HANDSHAKE_SECS), connect_fut) => result,
+    };
+    let mut ws = connected.map_err(|_| {
+        UpstreamError::new(
+            UpstreamErrorKind::Timeout,
+            "upstream WebSocket handshake timed out",
+            0,
+        )
+    })??;
 
     let send_frame = async |ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<TcpStream>,
@@ -600,6 +796,9 @@ pub async fn chat(
         .await?;
     }
     // 4. 发送 user_message 对话内容
+    if *cancel_rx.borrow() {
+        return Err(UpstreamError::cancelled());
+    }
     let mut turn_input = input.clone();
     turn_input.thread_id = thread_id.clone();
     let um = user_message(session, cfg, &turn_input);
@@ -612,6 +811,7 @@ pub async fn chat(
     let mut sent_tools: HashSet<String> = HashSet::new();
     let mut partial_args: HashMap<String, String> = HashMap::new();
     let mut text = String::new();
+    let mut pending_text = true;
     let mut thought = String::new();
     let mut live = true;
 
@@ -642,6 +842,11 @@ pub async fn chat(
             let typ = env.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let p_val = env.get("payload");
             let p = p_val.and_then(|v| v.as_object());
+
+            if (is_failure(typ) || typ == "guardrail_blocked") && is_quota_error(&env) {
+                *live = false;
+                return Some(Err(UpstreamError::quota()));
+            }
 
             match typ {
                 "_chunked_frame" => {
@@ -705,41 +910,16 @@ pub async fn chat(
                     )));
                 }
                 "text_delta" => {
-                    let delta = delta_text(p_val);
-                    if !delta.is_empty() {
-                        text.push_str(&delta);
-                        emit(UpstreamEvent::Text(delta));
-                    }
+                    push_reply_text(&mut text, &mut pending_text, delta_text(p_val), &emit);
                 }
                 "text_complete" => {
                     if text.is_empty() {
-                        if let Some(t) = p.and_then(|o| o.get("text")).and_then(|v| v.as_str()) {
-                            if !t.is_empty() {
-                                text.push_str(t);
-                                emit(UpstreamEvent::Text(t.to_string()));
-                            }
-                        }
+                        push_reply_text(&mut text, &mut pending_text, delta_text(p_val), &emit);
                     }
                 }
                 "turn_usage" => {
                     if let Some(o) = p {
-                        let count = |k: &str| o.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-                        let inp = count("input_tokens");
-                        let cr = count("cache_read_tokens");
-                        let cw = count("cache_write_tokens");
-                        if inp > 0 || cr > 0 || cw > 0 {
-                            usage.prompt = inp;
-                            usage.cache_read = cr;
-                            usage.cache_write = cw;
-                        }
-                        usage.completion += count("output_tokens");
-                        usage.total =
-                            usage.prompt + usage.cache_read + usage.cache_write + usage.completion;
-                        if let Some(m) = o.get("resolved_model_id").and_then(|v| v.as_str()) {
-                            if !m.is_empty() {
-                                usage.resolved_model_id = m.to_string();
-                            }
-                        }
+                        usage.record(o);
                     }
                 }
                 "tool_start" => {
@@ -900,6 +1080,18 @@ pub async fn chat(
                     }
                 }
                 "message_complete" => {
+                    if text.is_empty() {
+                        push_reply_text(&mut text, &mut pending_text, delta_text(p_val), &emit);
+                    }
+                    let cont = p
+                        .and_then(|o| o.get("continuation_expected"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if !cont && pending_text && is_quota_notice(&text) {
+                        *live = false;
+                        return Some(Err(UpstreamError::quota()));
+                    }
+
                     if let Some(items) = p.and_then(|o| o.get("tool_calls")).and_then(|v| v.as_array())
                     {
                         for item in items {
@@ -943,10 +1135,6 @@ pub async fn chat(
                             }
                         }
                     }
-                    let cont = p
-                        .and_then(|o| o.get("continuation_expected"))
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
                     *live = cont;
                     *complete_deadline = if cont {
                         None
@@ -978,6 +1166,13 @@ pub async fn chat(
                     }
                     if is_terminal(typ) {
                         *live = false;
+                        if typ == "turn_aborted" {
+                            return Some(Err(UpstreamError::new(
+                                UpstreamErrorKind::Transport,
+                                "Amazon Quick aborted the turn",
+                                502,
+                            )));
+                        }
                         return Some(Ok(()));
                     }
                 }
@@ -986,24 +1181,34 @@ pub async fn chat(
         None
     };
 
+    let closed_turn = |completed, message| {
+        if completed {
+            Ok(())
+        } else {
+            Err(UpstreamError::new(
+                UpstreamErrorKind::Transport,
+                message,
+                502,
+            ))
+        }
+    };
     loop {
         tokio::select! {
-            _ = cancel_rx.changed() => {
-                if *cancel_rx.borrow() {
-                    finish_result = Some(Err(UpstreamError::new(UpstreamErrorKind::Transport, "The request was aborted", 0)));
-                    break;
-                }
+            biased;
+            _ = wait_for_cancellation(&mut cancel_rx) => {
+                finish_result = Some(Err(UpstreamError::cancelled()));
+                break;
             }
             _ = tokio::time::sleep_until(req_deadline) => {
-                finish_result = Some(Err(UpstreamError::new(UpstreamErrorKind::Timeout, "the upstream request timed out", 504)));
+                finish_result = Some(if complete_deadline.is_some() {
+                    Ok(())
+                } else {
+                    Err(UpstreamError::new(UpstreamErrorKind::Timeout, "the upstream request timed out", 504))
+                });
                 break;
             }
             _ = tokio::time::sleep_until(idle_deadline) => {
-                if !text.is_empty() || !tools.is_empty() {
-                    finish_result = Some(Ok(()));
-                } else {
-                    finish_result = Some(Err(UpstreamError::new(UpstreamErrorKind::Timeout, "upstream WebSocket read timed out", 504)));
-                }
+                finish_result = Some(Err(UpstreamError::new(UpstreamErrorKind::Timeout, "upstream WebSocket read timed out", 504)));
                 break;
             }
             _ = async {
@@ -1024,24 +1229,15 @@ pub async fn chat(
                 match maybe_msg {
                     None => {
                         live = false;
-                        if !text.is_empty() || !tools.is_empty() {
-                            finish_result = Some(Ok(()));
-                        } else {
-                            finish_result = Some(Err(UpstreamError::new(UpstreamErrorKind::Transport, "upstream WebSocket closed", 502)));
-                        }
+                        finish_result = Some(closed_turn(complete_deadline.is_some(), "upstream WebSocket closed".to_owned()));
                         break;
                     }
                     Some(Err(e)) => {
                         live = false;
-                        if !text.is_empty() || !tools.is_empty() {
-                            finish_result = Some(Ok(()));
-                        } else {
-                            finish_result = Some(Err(UpstreamError::new(UpstreamErrorKind::Transport, format!("upstream WebSocket read: {e}"), 502)));
-                        }
+                        finish_result = Some(closed_turn(complete_deadline.is_some(), format!("upstream WebSocket read: {e}")));
                         break;
                     }
                     Some(Ok(msg)) => {
-                        idle_deadline = tokio::time::Instant::now() + Duration::from_secs(READ_IDLE_SECS);
                         let frames: Vec<String> = match msg {
                             Message::Text(t) => vec![t.to_string()],
                             Message::Binary(b) => {
@@ -1065,12 +1261,10 @@ pub async fn chat(
                             Message::Pong(_) => continue,
                             Message::Close(c) => {
                                 live = false;
-                                if !text.is_empty() || !tools.is_empty() {
-                                    finish_result = Some(Ok(()));
-                                } else {
-                                    let reason = c.map(|cf| format!("({}) {}", cf.code, cf.reason)).unwrap_or_default();
-                                    finish_result = Some(Err(UpstreamError::new(UpstreamErrorKind::Transport, format!("upstream WebSocket closed {reason}").trim(), 502)));
-                                }
+                                let message = c
+                                    .map(|cf| format!("upstream WebSocket closed ({}) {}", cf.code, cf.reason))
+                                    .unwrap_or_else(|| "upstream WebSocket closed".to_owned());
+                                finish_result = Some(closed_turn(complete_deadline.is_some(), message));
                                 break;
                             }
                             _ => continue,
@@ -1079,6 +1273,14 @@ pub async fn chat(
                         for frame in frames {
                             let Ok(env) = serde_json::from_str::<Value>(&frame) else { continue };
                             if !env.is_object() { continue; }
+                            let kind = env["type"].as_str().unwrap_or("");
+                            if kind.starts_with("tool_") || matches!(
+                                kind,
+                                "thinking_delta" | "text_delta" | "text_complete" | "message_start"
+                                    | "message_complete" | "turn_usage" | "_chunked_frame"
+                            ) {
+                                idle_deadline = tokio::time::Instant::now() + Duration::from_secs(READ_IDLE_SECS);
+                            }
                             if let Some(done) = handle_envelope(env, &mut live, &mut complete_deadline) {
                                 finish_result = Some(done);
                                 break;
@@ -1109,11 +1311,17 @@ pub async fn chat(
                             Message::Close(_) => break,
                             _ => continue,
                         };
-                        let done = frames.iter().any(|f| {
-                            serde_json::from_str::<Value>(f).ok().and_then(|v| {
-                                v.get("type").and_then(|t| t.as_str()).map(|s| s == "message_complete" || is_terminal(s) || is_failure(s))
-                            }).unwrap_or(false)
-                        });
+                        let mut done = false;
+                        for frame in frames {
+                            let Ok(event) = serde_json::from_str::<Value>(&frame) else { continue };
+                            let kind = event["type"].as_str().unwrap_or("");
+                            if kind == "turn_usage" {
+                                if let Some(payload) = event["payload"].as_object() {
+                                    usage.record(payload);
+                                }
+                            }
+                            done |= kind == "message_complete" || is_terminal(kind) || is_failure(kind);
+                        }
                         if done { break; }
                     }
                 }
@@ -1124,6 +1332,12 @@ pub async fn chat(
 
     match finish_result.unwrap_or(Ok(())) {
         Ok(()) => {
+            if pending_text && is_quota_notice(&text) {
+                return Err(UpstreamError::quota().with_reported_usage(usage));
+            }
+            if pending_text && !text.is_empty() {
+                emit(UpstreamEvent::Text(text.clone()));
+            }
             for tc in &mut tools {
                 if tc.name.trim().is_empty() {
                     tc.name = "unknown".to_string();
@@ -1146,6 +1360,6 @@ pub async fn chat(
                 usage,
             })
         }
-        Err(e) => Err(e),
+        Err(e) => Err(e.with_reported_usage(usage)),
     }
 }

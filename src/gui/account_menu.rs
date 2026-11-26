@@ -77,63 +77,62 @@ impl BridgeApp {
         let key = account.key.clone();
         let menu = self.account_menu.as_ref().filter(|menu| menu.key == key);
         let is_open = menu.is_some_and(AccountMenu::is_open);
-        div()
-            .id(("account-menu-trigger", index))
-            .relative()
-            .size(px(28.0))
-            .flex_shrink_0()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(2.5))
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .focusable()
-            .tab_stop(true)
-            .focus(move |style| style.bg(t.bg_hover))
-            .hover(move |style| style.bg(t.bg_hover))
-            .when(!is_open, |el| el.tooltip(Self::text_tooltip(t, "账号操作")))
-            .children((0..3).map(|_| div().size(px(2.5)).rounded_full().bg(t.text_secondary)))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if this
-                    .account_menu
-                    .as_ref()
-                    .is_some_and(|menu| menu.key == key && menu.is_open())
-                {
-                    this.dismiss_account_menu(window, cx);
-                } else {
-                    let menu = AccountMenu {
-                        key: key.clone(),
-                        focus: cx.focus_handle(),
-                        trigger_focus: window.focused(cx),
-                        closing: None,
-                        confirming_remove: false,
-                    };
-                    window.focus(&menu.focus);
-                    this.account_menu = Some(menu);
-                    cx.notify();
-                }
-            }))
-            .when_some(menu, |el, menu| {
-                el.when(is_open, |el| el.bg(t.bg_hover)).child(
-                    div()
-                        .absolute()
-                        .top(relative(1.0))
-                        .right_0()
-                        .mt(px(4.0))
-                        .size(px(0.0))
-                        .child(
-                            deferred(
-                                anchored()
-                                    .anchor(Corner::TopRight)
-                                    .child(Self::account_menu_panel(t, menu, account, loading, cx)),
-                            )
-                            .with_priority(2),
-                        ),
-                )
-            })
-            .into_any_element()
+        let trigger =
+            div()
+                .id(("account-menu-trigger", index))
+                .relative()
+                .size(px(28.0))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(2.5))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .focusable()
+                .tab_stop(true)
+                .focus(move |style| style.bg(t.bg_hover))
+                .hover(move |style| style.bg(t.bg_hover))
+                .when(!is_open, |el| el.tooltip(Self::text_tooltip(t, "账号操作")))
+                .children((0..3).map(|_| div().size(px(2.5)).rounded_full().bg(t.text_secondary)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this
+                        .account_menu
+                        .as_ref()
+                        .is_some_and(|menu| menu.key == key && menu.is_open())
+                    {
+                        this.dismiss_account_menu(window, cx);
+                    } else {
+                        let menu = AccountMenu {
+                            key: key.clone(),
+                            focus: cx.focus_handle(),
+                            trigger_focus: window.focused(cx),
+                            closing: None,
+                            confirming_remove: false,
+                        };
+                        window.focus(&menu.focus);
+                        this.account_menu = Some(menu);
+                        cx.notify();
+                    }
+                }))
+                .when_some(menu, |el, menu| {
+                    el.when(is_open, |el| el.bg(t.bg_hover)).child(
+                        div()
+                            .absolute()
+                            .top(relative(1.0))
+                            .right_0()
+                            .mt(px(4.0))
+                            .size(px(0.0))
+                            .child(
+                                deferred(anchored().anchor(Corner::TopRight).child(
+                                    Self::account_menu_panel(t, menu, account, loading, cx),
+                                ))
+                                .with_priority(2),
+                            ),
+                    )
+                });
+        motion::layout(trigger).into_any_element()
     }
 
     fn account_menu_panel(
@@ -381,7 +380,7 @@ impl BridgeApp {
             } else {
                 SpringConfig::EXIT
             },
-            panel,
+            motion::layout(panel).anchored(),
         )
         .into_any_element()
     }

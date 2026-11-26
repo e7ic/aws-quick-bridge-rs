@@ -16,7 +16,8 @@ use crate::config::{
 };
 use crate::oauth::{OAuthError, refresh_account};
 use crate::qbs::{self, UsageReport};
-use crate::threads::ThreadStore;
+use crate::threads::{ThreadStore, digest};
+use crate::upstream::ContextUsage;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use parking_lot::{Mutex, RwLock};
@@ -25,9 +26,9 @@ pub(crate) use request_stats::RequestProtocol;
 pub(crate) use request_stats::RequestSample;
 use request_stats::{RequestStatsStore, StatsUpdate};
 #[cfg(feature = "gui")]
-pub(crate) use usage_stats::{USAGE_RETENTION_DAYS, UsageHistory, UsageTotals};
-#[cfg(all(test, feature = "gui"))]
-pub(crate) use usage_stats::UsageBucket;
+pub(crate) use usage_stats::{
+    ContextSample, USAGE_RETENTION_DAYS, UsageBucket, UsageHistory, UsageTotals,
+};
 use usage_stats::UsageStore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -77,6 +78,7 @@ pub struct RequestLogEntry {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    pub context: Option<ContextUsage>,
     pub message: String,
 }
 
@@ -192,7 +194,9 @@ impl AccountPool {
             rr_cursor: Mutex::new(0),
             session_affinity: Mutex::new(HashMap::new()),
             refresh_locks: Mutex::new(HashMap::new()),
-            threads: Arc::new(Mutex::new(ThreadStore::new())),
+            threads: Arc::new(Mutex::new(ThreadStore::load(
+                data_dir.join("threads-v1.json"),
+            ))),
             logs: Mutex::new(VecDeque::with_capacity(MAX_LOG_ENTRIES)),
             request_stats: Arc::new(RequestStatsStore::load(data_dir.join("request-stats.bin"))),
             usage_stats: Arc::new(UsageStore::load(data_dir.join("usage-history-v1.json.gz"))),
@@ -410,6 +414,7 @@ impl AccountPool {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            context: None,
             message: message.into(),
         });
     }
@@ -441,6 +446,15 @@ impl AccountPool {
 
     /// 选择下一个可用账号（优先会话亲和，其次空闲主账号或轮询负载均衡）。
     pub fn pick_account(&self, conversation: &str, exclude: &HashSet<String>) -> Option<AccountRecord> {
+        self.pick_account_for_turn(conversation, exclude, None)
+    }
+
+    pub(crate) fn pick_account_for_turn(
+        &self,
+        conversation: &str,
+        exclude: &HashSet<String>,
+        thread_account: Option<&str>,
+    ) -> Option<AccountRecord> {
         let now_ms = Utc::now().timestamp_millis();
         let max_conc = self.settings().max_concurrency;
         let primary = self.primary_key.read().clone();
@@ -465,6 +479,15 @@ impl AccountPool {
                 && !exclude.contains(&rt.record.key())
                 && (allow_over_conc || rt.active_requests < max_conc)
         };
+
+        if let Some(account) = thread_account {
+            if let Some(rt) = accs
+                .iter()
+                .find(|a| is_eligible(a, false) && digest(&a.record.key()) == account)
+            {
+                return Some(rt.record.clone());
+            }
+        }
 
         // 1. 优先命中会话亲和绑定
         if !conversation.is_empty() {
@@ -577,20 +600,87 @@ impl AccountPool {
         self.notify();
     }
 
-    pub fn mark_cooldown(&self, account_key: &str, secs: Option<u64>, reason: impl Into<String>) {
+    pub fn mark_cooldown(
+        &self,
+        account_key: &str,
+        secs: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Option<i64> {
         let rest_secs = secs.unwrap_or(DEFAULT_COOLDOWN_SECS).max(30);
-        let until_epoch_ms = Utc::now().timestamp_millis() + (rest_secs as i64) * 1000;
-        let reason_str = reason.into();
+        let now = Utc::now().timestamp_millis();
+        let until_epoch_ms = now + (rest_secs as i64) * 1000;
+        let reason = reason.into();
         {
             let mut accs = self.accounts.write();
-            if let Some(rt) = accs.iter_mut().find(|a| a.record.key() == account_key) {
-                rt.health = AccountHealth::CoolingDown {
-                    until_epoch_ms,
-                    reason: reason_str.clone(),
-                };
+            let rt = accs.iter_mut().find(|a| a.record.key() == account_key)?;
+            if !rt.record.enabled || matches!(rt.health, AccountHealth::Expired { .. }) {
+                return None;
             }
+            if let AccountHealth::CoolingDown {
+                until_epoch_ms: current_until,
+                reason: current_reason,
+            } = &rt.health
+                && *current_until > now
+                && (*current_reason == reason || *current_until >= until_epoch_ms)
+            {
+                return None;
+            }
+            rt.health = AccountHealth::CoolingDown {
+                until_epoch_ms,
+                reason,
+            };
         }
         self.notify();
+        Some(until_epoch_ms)
+    }
+
+    pub(crate) fn refine_quota_cooldown(self: &Arc<Self>, auth: AccountRecord, marked_until: i64) {
+        let pool = self.clone();
+        tokio::spawn(async move {
+            let Some(spent) = qbs::spent(&auth, &pool.settings()).await else {
+                return;
+            };
+            if spent.secs == 0 {
+                return;
+            }
+            let key = auth.key();
+            let changed = {
+                let mut accounts = pool.accounts.write();
+                accounts
+                    .iter_mut()
+                    .find(|rt| rt.record.enabled && rt.record.key() == key)
+                    .and_then(|rt| match &mut rt.health {
+                        AccountHealth::CoolingDown { until_epoch_ms, .. }
+                            if *until_epoch_ms == marked_until =>
+                        {
+                            *until_epoch_ms = Utc::now().timestamp_millis()
+                                + spent.secs.min(6 * 3600) as i64 * 1000;
+                            Some(())
+                        }
+                        _ => None,
+                    })
+                    .is_some()
+            };
+            if changed {
+                pool.notify();
+            }
+        });
+    }
+
+    pub(crate) fn next_cooldown_retry(&self) -> Option<u64> {
+        let now = Utc::now().timestamp_millis();
+        self.accounts
+            .read()
+            .iter()
+            .filter(|rt| rt.record.enabled)
+            .filter_map(|rt| match rt.health {
+                AccountHealth::CoolingDown { until_epoch_ms, .. } if until_epoch_ms > now => {
+                    Some((until_epoch_ms - now) as u64)
+                }
+                _ => None,
+            })
+            .min()
+            .map(|ms| ms.div_ceil(1000))
     }
 
     pub fn mark_expired(&self, account_key: &str, reason: impl Into<String>) {
@@ -778,6 +868,7 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
             cached_tokens: 0,
+            context: None,
             message: "fixture".into(),
         };
         let completed = RequestLogEntry {
@@ -788,6 +879,10 @@ mod tests {
             input_tokens: 150,
             output_tokens: 25,
             cached_tokens: 65,
+            context: Some(ContextUsage {
+                used_tokens: Some(150),
+                window_tokens: std::num::NonZeroU64::new(262_144),
+            }),
             ..failure.clone()
         };
         pool.push_gateway_log("account-a", failure);
@@ -800,6 +895,18 @@ mod tests {
         let history = make_pool().usage_history();
         assert_eq!(history.buckets.len(), 2);
         assert_eq!(history.account_label("account-b"), Some("B"));
+        assert_eq!(history.contexts.len(), 2);
+        let (_, unreported) = history.contexts.first_key_value().unwrap();
+        assert_eq!(unreported.len(), 1);
+        assert_eq!(unreported[0].usage, None);
+        let (bucket, contexts) = history.contexts.last_key_value().unwrap();
+        assert_eq!(bucket.account, "account-b");
+        assert_eq!(bucket.model, "resolved-model");
+        assert_eq!(bucket.protocol, RequestProtocol::Messages);
+        assert_eq!(contexts.len(), 1);
+        let usage = contexts[0].usage.unwrap();
+        assert_eq!(usage.used_tokens, Some(150));
+        assert_eq!(usage.window_tokens.map(|value| value.get()), Some(262_144));
         let mut totals = UsageTotals::default();
         for (bucket, usage) in &history.buckets {
             totals.add(*usage);

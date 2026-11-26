@@ -19,16 +19,17 @@ Rust 重写的 Amazon Quick（QuickWork）多协议桥接器，内置自主实�
 - **个人账号协议链路**：
   - Amazon Quick 个人账号原生桌面端 OAuth（PKCE S256、动态客户端注册、固定 `deviceId`、自动续期）。
   - AWS event-stream（CRC32）双向 WebSocket 帧编解码（AIDP）、HTTP `CONNECT` 代理隧道、25 秒应用层+WS 双心跳、`stop_generation`、`_chunked_frame` 重组、`resolved_model_id` 采集。
-  - `<client_tool_call>` 客户端工具桥接流式解析（含未转义引号/控制符 JSON 容错修复）、64 KB 帧预算渐进压缩与附件转存（含 DLP 扫描）、多轮线程复用、CJK 语言保真提示。
+  - `<client_tool_call>` 客户端工具桥接流式解析（含未转义引号/控制符 JSON 容错修复）、64 KB 帧预算渐进压缩与附件转存（含 DLP 扫描）、多轮线程复用、CJK 语言保真提示。重启后可用本地摘要续接原 Quick 会话，摘要保留 24 小时。
 - **自主实现原 Magpie 宿主能力**：
   - 多账号池（`~/.aws-quick-bridge/accounts.json` / `%USERPROFILE%\.aws-quick-bridge\accounts.json`，自动兼容同步 `account.json` 与 `config.json`）。
-  - 会话粘性路由、并发上限控制、401 强制续期与过期故障切换、429 额度耗尽冷却轮询。
+  - 会话粘性路由、并发上限控制、401 强制续期与过期故障切换。识别 Quick 作为普通回复返回的额度耗尽提示，自动冷却和切换账号。
 - **三协议 HTTP 网关**：
   - `POST /v1/messages` & `/v1/messages/count_tokens`（Claude Code）
   - `/claude-desktop` 接入地址提供 Claude Desktop 专用的 Messages、Token 计数与模型发现接口。
   - `POST /v1/responses`（Codex）
   - `POST /v1/chat/completions`（OpenCode 等）
   - `GET /v1/models`、`GET /health`，支持本机 `127.0.0.1` 与局域网 `0.0.0.0` 一键切换。
+  - 客户端取消或断开时自动停止上游生成，日志会标记取消的请求。
 - **跨平台 GPUI 桌面端（Loopo 风格 + Solar Bold SVG + MiSans）**：
   - 随应用提供子集化 MiSans 2 个字重（Regular / Medium，含 4000+ 界面与常用汉字，生僻字自动回退系统字体）、矢量 SVG Logo（浅/深双色）与 27 枚 Solar Bold SVG 图标。macOS 通用包的两个架构共用一套无损压缩的字体文件，可使用 `sh scripts/subset-fonts.sh` 重新生成字集。
   - 支持事件驱动低延迟刷新、物理弹簧过渡动效、30 天本地聚合用量统计，以及额度查询、模型探测与 OAuth 登录等待全链路骨架屏。

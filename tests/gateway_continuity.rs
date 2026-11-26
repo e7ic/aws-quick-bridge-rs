@@ -1,0 +1,535 @@
+//! Exercises the real HTTP gateway with a local Quick server and fixture credentials.
+
+use aws_quick_bridge_rs::config::{
+    AccountRecord, AccountsFile, BridgeConfig, save_accounts, save_config,
+};
+use aws_quick_bridge_rs::gateway::{RunningServer, start_server};
+use aws_quick_bridge_rs::pool::{AccountHealth, AccountPool};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::{Message, handshake::server::Request};
+
+const SIGN_IN: &str = "test-gateway-key";
+const LIMIT_NOTICE: &str = "You've reached your usage limit. Check your profile for details.";
+
+async fn receive(ws: &mut WebSocketStream<TcpStream>) -> Option<Value> {
+    while let Some(msg) = ws.next().await {
+        if let Ok(Message::Binary(bytes)) = msg {
+            let outer: Value = serde_json::from_slice(&bytes).unwrap();
+            let bytes = STANDARD
+                .decode(outer["payload"]["payload"].as_str().unwrap())
+                .unwrap();
+            return Some(serde_json::from_slice(&bytes).unwrap());
+        }
+    }
+    None
+}
+
+async fn send(ws: &mut WebSocketStream<TcpStream>, event: &str, payload: Value) {
+    ws.send(Message::text(
+        json!({ "type": event, "payload": payload }).to_string(),
+    ))
+    .await
+    .unwrap();
+}
+
+async fn complete(ws: &mut WebSocketStream<TcpStream>) {
+    send(ws, "message_complete", json!({})).await;
+    send(ws, "turn_completed", json!({})).await;
+}
+
+async fn quick_turn(
+    stream: TcpStream,
+    turns: mpsc::UnboundedSender<(String, Value)>,
+    stopped: mpsc::UnboundedSender<Value>,
+) {
+    let mut account = String::new();
+    let mut ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, response| {
+        account = req.headers()["authorization"].to_str().unwrap().to_owned();
+        Ok(response)
+    })
+    .await
+    .unwrap();
+    while let Some(msg) = receive(&mut ws).await {
+        if msg["type"] != "user_message" {
+            continue;
+        }
+        let input = &msg["payload"];
+        let text = input["text"].as_str().unwrap();
+        turns.send((account.clone(), input.clone())).unwrap();
+        if text.contains("wait for cancellation") {
+            send(&mut ws, "text_delta", json!({"text":"stream started"})).await;
+            while let Some(event) = receive(&mut ws).await {
+                if event["type"] == "stop_generation" {
+                    stopped.send(event["payload"]["thread_id"].clone()).unwrap();
+                    send(
+                        &mut ws,
+                        "turn_usage",
+                        json!({
+                            "input_tokens": 75, "cache_read_tokens": 0, "cache_write_tokens": 0,
+                            "context_window": 320_000
+                        }),
+                    )
+                    .await;
+                    send(&mut ws, "turn_aborted", json!({})).await;
+                    return;
+                }
+            }
+        } else {
+            if text.contains("rebuild old thread") && !text.contains("remember this question") {
+                send(
+                    &mut ws,
+                    "session_error",
+                    json!({"message":"Quick thread no longer exists"}),
+                )
+                .await;
+                return;
+            }
+            if text.contains("interrupted upstream") {
+                send(&mut ws, "text_delta", json!({"text":"partial reply"})).await;
+                send(
+                    &mut ws,
+                    "turn_usage",
+                    json!({
+                        "input_tokens": 20, "cache_read_tokens": 40, "cache_write_tokens": 40,
+                        "context_window": 200_000, "resolved_model_id": "fixture-model"
+                    }),
+                )
+                .await;
+                send(
+                    &mut ws,
+                    "stream_error",
+                    json!({"message":"upstream disconnected"}),
+                )
+                .await;
+                return;
+            }
+            if text.contains("all allowances spent") {
+                if account == "Bearer fixture-a" {
+                    send(&mut ws, "error", json!({"failure_type":"usage_limit"})).await;
+                } else {
+                    send(&mut ws, "message_complete", json!({"text":LIMIT_NOTICE})).await;
+                }
+                return;
+            }
+            if text.contains("spend allowance") && account == "Bearer fixture-a" {
+                send(
+                    &mut ws,
+                    "text_delta",
+                    json!({"text":"You've reached your usage limit."}),
+                )
+                .await;
+                send(
+                    &mut ws,
+                    "text_delta",
+                    json!({"text":" Check your profile for details."}),
+                )
+                .await;
+            } else if text.contains("quote allowance") {
+                send(&mut ws, "text_delta", json!({"text":LIMIT_NOTICE})).await;
+                send(&mut ws, "text_delta", json!({"text":" is an example."})).await;
+            } else {
+                send(&mut ws, "text_delta", json!({"text":"fixture answer"})).await;
+                if text == "continue" {
+                    send(&mut ws, "turn_usage", json!({
+                        "input_tokens": 4, "cache_read_tokens": 32_910, "cache_write_tokens": 37_233,
+                        "output_tokens": 4, "context_window": 262_144
+                    })).await;
+                    send(&mut ws, "turn_usage", json!({"output_tokens": 1})).await;
+                }
+            }
+            complete(&mut ws).await;
+        }
+        return;
+    }
+}
+
+fn account(id: &str, quick_port: u16, usage_port: u16) -> AccountRecord {
+    serde_json::from_value(json!({
+        "access": format!("fixture-{id}"),
+        "accountId": id,
+        "email": id,
+        "expires": chrono::Utc::now().timestamp_millis() + 3_600_000,
+        "tenantUrl": format!("http://127.0.0.1:{usage_port}"),
+        "wsHost": format!("ws://127.0.0.1:{quick_port}"),
+    }))
+    .unwrap()
+}
+
+fn request(
+    client: &reqwest::Client,
+    gateway: &RunningServer,
+    messages: Value,
+    stream: bool,
+) -> reqwest::RequestBuilder {
+    client
+        .post(format!("http://{}/v1/chat/completions", gateway.addr))
+        .bearer_auth(SIGN_IN)
+        .header("x-session-id", "fixture-conversation")
+        .json(&json!({ "model": "smart", "messages": messages, "stream": stream }))
+}
+
+async fn gateway(pool: Arc<AccountPool>) -> RunningServer {
+    start_server(pool, "127.0.0.1", 0).await.unwrap()
+}
+
+async fn wait_for_log(pool: &AccountPool, api: &str, status: u16, count: usize) {
+    let mut changes = pool.subscribe();
+    timeout(Duration::from_secs(2), async {
+        while pool
+            .snapshot()
+            .logs
+            .iter()
+            .filter(|log| log.api == api && log.status == status)
+            .count()
+            < count
+        {
+            changes.recv().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn resumes_after_restart_fails_over_on_quota_and_stops_on_disconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    // This integration test is the only test in its process. All workers use this fixture home.
+    unsafe { std::env::set_var("AWS_QUICK_BRIDGE_HOME", dir.path()) };
+    let quick = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let quick_port = quick.local_addr().unwrap().port();
+    let (turns_tx, mut turns) = mpsc::unbounded_channel();
+    let (stopped_tx, mut stopped) = mpsc::unbounded_channel();
+    let quick_task = tokio::spawn(async move {
+        while let Ok((tcp, _)) = quick.accept().await {
+            tokio::spawn(quick_turn(tcp, turns_tx.clone(), stopped_tx.clone()));
+        }
+    });
+    let usage = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let usage_port = usage.local_addr().unwrap().port();
+    let usage_task = tokio::spawn(async {
+        let app = axum::Router::new().fallback(|| async {
+            axum::Json(json!({"session":{"used":100,"limit":100,"resume_in_minutes":4}}))
+        });
+        axum::serve(usage, app).await.unwrap();
+    });
+
+    save_config(&BridgeConfig {
+        api_key: SIGN_IN.into(),
+        port: 0,
+        host: "127.0.0.1".into(),
+        options: serde_json::from_value(json!({"header_wait":"off","stateful":true})).unwrap(),
+    })
+    .unwrap();
+    let primary = account("a", quick_port, usage_port);
+    save_accounts(&AccountsFile {
+        primary_key: primary.key(),
+        accounts: vec![primary, account("b", quick_port, usage_port)],
+    })
+    .unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(6))
+        .build()
+        .unwrap();
+    let first = gateway(AccountPool::load().unwrap()).await;
+    request(
+        &client,
+        &first,
+        json!([{"role":"user","content":"remember this question"}]),
+        false,
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap();
+    let (_, original) = turns.recv().await.unwrap();
+    first.stop_and_wait().await;
+
+    let pool = AccountPool::load().unwrap();
+    let running = gateway(pool.clone()).await;
+    request(
+        &client,
+        &running,
+        json!([
+            {"role":"user","content":"remember this question"},
+            {"role":"assistant","content":"fixture answer"},
+            {"role":"user","content":"continue"}
+        ]),
+        false,
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap();
+    let (_, continuation) = turns.recv().await.unwrap();
+    let context = pool
+        .snapshot()
+        .logs
+        .into_iter()
+        .find(|entry| entry.api == "chat" && entry.status == 200)
+        .and_then(|entry| entry.context)
+        .unwrap();
+    assert_eq!(context.used_tokens, Some(70_147));
+    assert_eq!(
+        context.window_tokens.map(|value| value.get()),
+        Some(262_144)
+    );
+
+    request(
+        &client,
+        &running,
+        json!([
+            {"role":"user","content":"remember this question"},
+            {"role":"assistant","content":"fixture answer"},
+            {"role":"user","content":"continue"},
+            {"role":"assistant","content":"fixture answer"},
+            {"role":"user","content":"rebuild old thread"}
+        ]),
+        false,
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap();
+    let (_, stale) = turns.recv().await.unwrap();
+    let (_, rebuilt) = turns.recv().await.unwrap();
+    assert_eq!(stale["thread_id"], continuation["thread_id"]);
+    assert_ne!(rebuilt["thread_id"], stale["thread_id"]);
+    assert!(
+        rebuilt["text"]
+            .as_str()
+            .unwrap()
+            .contains("remember this question")
+    );
+
+    let quote = request(
+        &client,
+        &running,
+        json!([{"role":"user","content":"quote allowance"}]),
+        true,
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
+    turns.recv().await.unwrap();
+    let failover = request(
+        &client,
+        &running,
+        json!([{"role":"user","content":"spend allowance"}]),
+        true,
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .text()
+    .await
+    .unwrap();
+    let (quota_account, _) = turns.recv().await.unwrap();
+    let fallback = turns.try_recv().ok();
+    let primary_health = pool.snapshot().accounts[0].health.clone();
+
+    let mut streaming = request(
+        &client,
+        &running,
+        json!([{"role":"user","content":"wait for cancellation"}]),
+        true,
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap();
+    let (_, interrupted) = turns.recv().await.unwrap();
+    while let Some(chunk) = streaming.chunk().await.unwrap() {
+        if String::from_utf8_lossy(&chunk).contains("stream started") {
+            break;
+        }
+    }
+    drop(streaming);
+    let stop = timeout(Duration::from_secs(2), stopped.recv())
+        .await
+        .ok()
+        .flatten();
+    wait_for_log(&pool, "chat", 499, 1).await;
+
+    let pending = request(
+        &client,
+        &running,
+        json!([{"role":"user","content":"wait for cancellation"}]),
+        false,
+    );
+    let pending = tokio::spawn(pending.send());
+    let (_, before_headers) = turns.recv().await.unwrap();
+    pending.abort();
+    let stopped_before_headers = timeout(Duration::from_secs(2), stopped.recv())
+        .await
+        .unwrap();
+    assert_eq!(
+        stopped_before_headers,
+        Some(before_headers["thread_id"].clone())
+    );
+    wait_for_log(&pool, "chat", 499, 2).await;
+    for entry in pool
+        .snapshot()
+        .logs
+        .iter()
+        .filter(|entry| entry.api == "chat" && entry.status == 499)
+    {
+        let context = entry.context.unwrap();
+        assert_eq!(context.used_tokens, Some(75));
+        assert_eq!(
+            context.window_tokens.map(|value| value.get()),
+            Some(320_000)
+        );
+    }
+
+    for (path, api, body, event) in [
+        (
+            "/v1/messages",
+            "messages",
+            json!({"model":"smart","stream":true,"max_tokens":128,"messages":[{"role":"user","content":"interrupted upstream"}]}),
+            "event: error",
+        ),
+        (
+            "/v1/responses",
+            "responses",
+            json!({"model":"smart","stream":true,"input":"interrupted upstream"}),
+            "event: response.failed",
+        ),
+    ] {
+        let response = client
+            .post(format!("http://{}{path}", running.addr))
+            .bearer_auth(SIGN_IN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        turns.recv().await.unwrap();
+        assert!(response.contains("partial reply"));
+        assert!(response.contains(event));
+        assert!(!response.contains("response.completed"));
+        assert!(!response.contains("event: message_stop"));
+        wait_for_log(&pool, api, 502, 1).await;
+        let error = pool
+            .snapshot()
+            .logs
+            .into_iter()
+            .find(|entry| entry.api == api && entry.status == 502)
+            .unwrap();
+        assert_eq!(error.resolved_model, "fixture-model");
+        let context = error.context.unwrap();
+        assert_eq!(context.used_tokens, Some(100));
+        assert_eq!(
+            context.window_tokens.map(|value| value.get()),
+            Some(200_000)
+        );
+    }
+
+    running.stop_and_wait().await;
+    let pool = AccountPool::load().unwrap();
+    let running = gateway(pool.clone()).await;
+    request(
+        &client,
+        &running,
+        json!([
+            {"role":"user","content":"spend allowance"},
+            {"role":"assistant","content":"fixture answer"},
+            {"role":"user","content":"continue after the fallback"}
+        ]),
+        false,
+    )
+    .send()
+    .await
+    .unwrap()
+    .error_for_status()
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap();
+    let (restored_account, restored_turn) = turns.recv().await.unwrap();
+    assert_eq!(restored_account, "Bearer fixture-b");
+    assert_eq!(
+        restored_turn["thread_id"],
+        fallback.as_ref().unwrap().1["thread_id"]
+    );
+    assert!(
+        !restored_turn["text"]
+            .as_str()
+            .unwrap()
+            .contains("spend allowance")
+    );
+
+    for _ in 0..2 {
+        let limited = request(
+            &client,
+            &running,
+            json!([{"role":"user","content":"all allowances spent"}]),
+            false,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(limited.status(), 429);
+        assert!(limited.headers().contains_key(reqwest::header::RETRY_AFTER));
+    }
+    assert_eq!(turns.len(), 2, "cooling accounts were tried again");
+    running.stop_and_wait().await;
+    usage_task.abort();
+    quick_task.abort();
+
+    let resumed = continuation["thread_id"] == original["thread_id"]
+        && !continuation["text"]
+            .as_str()
+            .unwrap()
+            .contains("remember this question");
+    let failover_ok = quota_account == "Bearer fixture-a"
+        && fallback
+            .as_ref()
+            .is_some_and(|(account, _)| account == "Bearer fixture-b")
+        && matches!(primary_health, AccountHealth::CoolingDown { .. })
+        && failover.contains("fixture answer")
+        && !failover.contains("reached your usage limit");
+    assert_eq!(
+        (
+            resumed,
+            quote.contains("is an example."),
+            failover_ok,
+            stop == Some(interrupted["thread_id"].clone()),
+        ),
+        (true, true, true, true),
+        "respectively: resume, quote, failover, stop"
+    );
+}

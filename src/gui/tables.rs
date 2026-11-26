@@ -1,4 +1,5 @@
 use super::components::{BtnVariant, Theme};
+use super::motion;
 use super::{BridgeApp, numeric_font};
 use gpui::{AnyElement, Context, Div, FontWeight, div, prelude::*, px};
 use std::{cmp::Ordering, ops::Range};
@@ -143,7 +144,7 @@ impl BridgeApp {
         page: TablePage,
         on_page: fn(&mut Self, usize),
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> impl IntoElement {
         let range = page.range();
         let page_button = |suffix, label, target: Option<usize>, cx: &mut Context<Self>| {
             Self::button(
@@ -165,16 +166,26 @@ impl BridgeApp {
                 cx,
             )
         };
-        Self::table_row(t)
+        let footer = Self::table_row(t)
+            .id(id)
             .justify_between()
             .text_color(t.text_muted)
             .text_size(px(11.5))
-            .child(div().font(numeric_font()).child(format!(
-                "第 {}–{} 条，共 {} 条",
-                range.start + 1,
-                range.end,
-                page.total
-            )))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(3.0))
+                    .child("第")
+                    .child(div().font(numeric_font()).child(format!(
+                        "{}–{}",
+                        range.start + 1,
+                        range.end
+                    )))
+                    .child("条，共")
+                    .child(div().font(numeric_font()).child(page.total.to_string()))
+                    .child("条"),
+            )
             .child(
                 div()
                     .flex()
@@ -187,7 +198,8 @@ impl BridgeApp {
                         page.count
                     )))
                     .child(page_button("next", "下一页", page.next(), cx)),
-            )
+            );
+        motion::layout(footer)
     }
 }
 

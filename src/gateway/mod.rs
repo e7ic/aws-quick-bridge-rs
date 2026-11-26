@@ -9,13 +9,15 @@ pub mod responses;
 use crate::chat::{
     ChatFailure, ChatOutput, NormalizedUsage, TurnEvent, prepare, run_turn_for_account,
 };
-use crate::config::{account_models, model_display_name, quick_model, resolve_quick_model};
+use crate::config::{
+    AccountRecord, account_models, model_display_name, quick_model, resolve_quick_model,
+};
 use crate::pool::{AccountPool, LogLevel, RequestLogEntry};
 use crate::qbs;
-use crate::threads::conversation_of;
+use crate::threads::{ThreadHistory, conversation_of};
 use anyhow::Result;
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
@@ -123,7 +125,7 @@ impl ApiKind {
 
 fn openai_from_chat(
     output: ChatOutput,
-    on_done: impl FnOnce(Option<NormalizedUsage>) + Send + 'static,
+    on_done: impl FnOnce(Result<NormalizedUsage, ChatFailure>) + Send + 'static,
 ) -> Response {
     match output {
         ChatOutput::Completed(res) => {
@@ -154,7 +156,7 @@ fn openai_from_chat(
                 "tool_calls"
             };
             let usage_val = res.usage.openai_json();
-            on_done(Some(res.usage));
+            on_done(Ok(res.usage));
             axum::Json(json!({
                 "id": res.id,
                 "object": "chat.completion",
@@ -181,8 +183,10 @@ fn openai_from_chat(
                 }));
 
                 let mut tool_idx = 0usize;
-                let mut final_usage: Option<NormalizedUsage> = None;
-                while let Some(ev) = started.rx.recv().await {
+                let outcome = loop {
+                    let Some(ev) = started.rx.recv().await else {
+                        break Err(ChatFailure::incomplete());
+                    };
                     match ev {
                         TurnEvent::Reasoning(r) => {
                             send_json(&json!({
@@ -224,11 +228,11 @@ fn openai_from_chat(
                                 }]
                             }));
                         }
-                        TurnEvent::Error(msg) => {
+                        TurnEvent::Error(failure) => {
                             send_json(&json!({
-                                "error": { "message": msg, "type": "upstream_error", "code": "upstream_error" }
+                                "error": { "message": failure.message, "type": failure.code, "code": failure.code }
                             }));
-                            break;
+                            break Err(failure);
                         }
                         TurnEvent::Done(u) => {
                             let finish = if tool_idx > 0 { "tool_calls" } else { "stop" };
@@ -249,13 +253,12 @@ fn openai_from_chat(
                                     "usage": u.openai_json(),
                                 }));
                             }
-                            final_usage = Some(u);
-                            break;
+                            break Ok(u);
                         }
                     }
-                }
+                };
                 let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n")));
-                on_done(final_usage);
+                on_done(outcome);
             });
 
             let stream = UnboundedReceiverStream::new(rx).boxed();
@@ -312,13 +315,83 @@ fn models_response(data: Vec<Value>) -> Response {
     .into_response()
 }
 
-/// 多账号故障切换执行循环（自主替代 Magpie 宿主调度逻辑）。
+// A disconnected client drops either the handler future or its response body.
+// The request worker stays alive long enough to stop generation upstream.
+struct RequestCancellation(watch::Sender<bool>);
+
+impl Drop for RequestCancellation {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
+impl RequestCancellation {
+    fn attach(self, response: Response) -> Response {
+        let (parts, body) = response.into_parts();
+        let stream = body.into_data_stream().map(move |chunk| {
+            let _cancellation = &self;
+            chunk
+        });
+        Response::from_parts(parts, Body::from_stream(stream))
+    }
+}
+
+fn account_failed(pool: &Arc<AccountPool>, auth: &AccountRecord, failure: &ChatFailure) {
+    let key = auth.key();
+    if failure.status == 401 && failure.sign_in_expired {
+        pool.mark_expired(&key, &failure.message);
+    } else if failure.status == 429 {
+        let marked = pool.mark_cooldown(&key, failure.retry_after_secs, &failure.message);
+        if let Some(until) = marked.filter(|_| failure.confirmed_quota()) {
+            pool.refine_quota_cooldown(auth.clone(), until);
+        }
+    }
+}
+
+fn failure_level(status: u16) -> LogLevel {
+    match status {
+        429 => LogLevel::Warn,
+        499 => LogLevel::Info,
+        _ => LogLevel::Error,
+    }
+}
+
 async fn execute_with_pool(
     pool: Arc<AccountPool>,
     api: ApiKind,
     headers: HeaderMap,
     raw_body: Bytes,
     desktop: bool,
+) -> Response {
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let cancellation = RequestCancellation(cancel_tx);
+    let response = tokio::spawn(execute_request(
+        pool, api, headers, raw_body, desktop, cancel_rx,
+    ))
+    .await
+    .unwrap_or_else(|_| {
+        let failure = ChatFailure::incomplete();
+        api.error(failure.status, &failure.message, &failure.code, None)
+    });
+    if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|value| value.as_bytes().starts_with(b"text/event-stream"))
+    {
+        cancellation.attach(response)
+    } else {
+        response
+    }
+}
+
+/// 多账号故障切换执行循环。
+async fn execute_request(
+    pool: Arc<AccountPool>,
+    api: ApiKind,
+    headers: HeaderMap,
+    raw_body: Bytes,
+    desktop: bool,
+    cancel_rx: watch::Receiver<bool>,
 ) -> Response {
     let started_at = Instant::now();
     let body: Value = match serde_json::from_slice::<Value>(&raw_body) {
@@ -396,18 +469,57 @@ async fn execute_with_pool(
         .unwrap_or_else(|| quick_model(raw_model, &cfg.default_model));
     chat_body["model"] = json!(mapped_model);
 
+    let turn = match prepare(&chat_body, &cfg) {
+        Ok(turn) => Arc::new(turn),
+        Err(e) => return api.error(400, &e.to_string(), "invalid_request_error", None),
+    };
+    let history = cfg.stateful.then(|| {
+        Arc::new(ThreadHistory::new(
+            &conversation,
+            &turn.model,
+            &turn.system,
+            &turn.convo,
+        ))
+    });
+    let preferred_account = history.as_ref().and_then(|history| {
+        pool.threads
+            .lock()
+            .preferred_account(history)
+            .map(str::to_owned)
+    });
+    let run_attempt = |auth| {
+        run_turn_for_account(
+            turn.clone(),
+            auth,
+            cfg.clone(),
+            history.clone(),
+            pool.threads.clone(),
+            cancel_rx.clone(),
+        )
+    };
+
     let mut tried: HashSet<String> = HashSet::new();
     let mut last_failure: Option<ChatFailure> = None;
 
     for _attempt in 0..8 {
-        let Some(picked) = pool.pick_account(&conversation, &tried) else {
+        if *cancel_rx.borrow() {
+            return api.error(
+                499,
+                "The client cancelled the request",
+                "request_cancelled",
+                None,
+            );
+        }
+        let Some(picked) =
+            pool.pick_account_for_turn(&conversation, &tried, preferred_account.as_deref())
+        else {
             break;
         };
         let acc_key = picked.key();
         let acc_label = picked.display_label();
         tried.insert(acc_key.clone());
 
-        let auth = match pool.ensure_fresh(&acc_key, false).await {
+        let mut auth = match pool.ensure_fresh(&acc_key, false).await {
             Ok(a) => a,
             Err(e) => {
                 last_failure = Some(ChatFailure {
@@ -420,47 +532,24 @@ async fn execute_with_pool(
                     message: e.to_string(),
                     sign_in_expired: e.is_expired(),
                     retry_after_secs: None,
+                    reported_usage: None,
                 });
                 continue;
             }
         };
 
-        let turn = match prepare(&chat_body, &cfg) {
-            Ok(t) => t,
-            Err(e) => {
-                return api.error(400, &e.to_string(), "invalid_request_error", None);
-            }
-        };
-
         let active_request = pool.track_request(&acc_key);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let mut res = run_turn_for_account(
-            turn,
-            auth.clone(),
-            cfg.clone(),
-            conversation.clone(),
-            pool.threads.clone(),
-            cancel_rx.clone(),
-        )
-        .await;
+        let mut res = run_attempt(auth.clone()).await;
 
         // 若返回 401 且判定令牌过期，先对当前账号强制刷新重试一次，失败后再切换其他账号。
-        if let Err(ref f) = res {
-            if f.status == 401 && f.sign_in_expired {
-                if let Ok(renewed) = pool.ensure_fresh(&acc_key, true).await {
-                    if let Ok(turn2) = prepare(&chat_body, &cfg) {
-                        res = run_turn_for_account(
-                            turn2,
-                            renewed,
-                            cfg.clone(),
-                            conversation.clone(),
-                            pool.threads.clone(),
-                            cancel_rx,
-                        )
-                        .await;
-                    }
-                }
-            }
+        if res
+            .as_ref()
+            .is_err_and(|f| f.status == 401 && f.sign_in_expired)
+            && !*cancel_rx.borrow()
+            && let Ok(renewed) = pool.ensure_fresh(&acc_key, true).await
+        {
+            auth = renewed;
+            res = run_attempt(auth.clone()).await;
         }
 
         match res {
@@ -471,36 +560,51 @@ async fn execute_with_pool(
                 let req_model_done = mapped_model.clone();
                 let api_label = api.label().to_string();
 
-                let on_done = move |usage: Option<NormalizedUsage>| {
-                    let resolved = usage
-                        .as_ref()
-                        .map(|u| u.resolved_model_id.clone())
-                        .unwrap_or_default();
-                    active_request.finish(&resolved);
-                    let (inp, out, cached) = usage
-                        .as_ref()
-                        .map(|u| (u.prompt_tokens, u.completion_tokens, u.cached_tokens))
-                        .unwrap_or((0, 0, 0));
+                let on_done = move |outcome: Result<NormalizedUsage, ChatFailure>| {
                     let latency = started_at.elapsed().as_millis() as u64;
-                    let msg = if resolved.is_empty() {
-                        format!("{api_label} {req_model_done} ok ({latency}ms)")
-                    } else {
-                        format!("{api_label} {req_model_done} -> {resolved} ({latency}ms)")
+                    let (status, level, usage, message) = match outcome {
+                        Ok(usage) => {
+                            let msg = if usage.resolved_model_id.is_empty() {
+                                format!("{api_label} {req_model_done} ok ({latency}ms)")
+                            } else {
+                                format!(
+                                    "{api_label} {req_model_done} -> {} ({latency}ms)",
+                                    usage.resolved_model_id
+                                )
+                            };
+                            (200, LogLevel::Info, usage, msg)
+                        }
+                        Err(failure) => {
+                            account_failed(&pool_done, &auth, &failure);
+                            let msg = format!("HTTP {}: {}", failure.status, failure.message);
+                            (
+                                failure.status,
+                                failure_level(failure.status),
+                                failure.reported_usage.unwrap_or_default(),
+                                msg,
+                            )
+                        }
                     };
-                    pool_done.push_gateway_log(&acc_key, RequestLogEntry {
-                        timestamp: Utc::now(),
-                        level: LogLevel::Info,
-                        api: api_label,
-                        requested_model: req_model_done,
-                        resolved_model: resolved,
-                        account: acc_label_done,
-                        status: 200,
-                        latency_ms: latency,
-                        input_tokens: inp,
-                        output_tokens: out,
-                        cached_tokens: cached,
-                        message: msg,
-                    });
+                    let resolved = usage.resolved_model_id;
+                    active_request.finish(&resolved);
+                    pool_done.push_gateway_log(
+                        &acc_key,
+                        RequestLogEntry {
+                            timestamp: Utc::now(),
+                            level,
+                            api: api_label,
+                            requested_model: req_model_done,
+                            resolved_model: resolved,
+                            account: acc_label_done,
+                            status,
+                            latency_ms: latency,
+                            input_tokens: usage.prompt_tokens,
+                            output_tokens: usage.completion_tokens,
+                            cached_tokens: usage.cached_tokens,
+                            context: usage.context,
+                            message,
+                        },
+                    );
                 };
 
                 return match api {
@@ -513,28 +617,29 @@ async fn execute_with_pool(
                     _ => openai_from_chat(output, on_done),
                 };
             }
-            Err(f) => {
+            Err(mut f) => {
                 drop(active_request);
                 let latency = started_at.elapsed().as_millis() as u64;
-                if f.status == 401 && f.sign_in_expired {
-                    pool.mark_expired(&acc_key, &f.message);
-                } else if f.status == 429 {
-                    pool.mark_cooldown(&acc_key, f.retry_after_secs, &f.message);
-                }
-                pool.push_gateway_log(&acc_key, RequestLogEntry {
-                    timestamp: Utc::now(),
-                    level: if f.status == 429 { LogLevel::Warn } else { LogLevel::Error },
-                    api: api.label().to_string(),
-                    requested_model: mapped_model.clone(),
-                    resolved_model: String::new(),
-                    account: acc_label,
-                    status: f.status,
-                    latency_ms: latency,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    cached_tokens: 0,
-                    message: format!("HTTP {}: {}", f.status, f.message),
-                });
+                account_failed(&pool, &auth, &f);
+                let usage = f.reported_usage.take().unwrap_or_default();
+                pool.push_gateway_log(
+                    &acc_key,
+                    RequestLogEntry {
+                        timestamp: Utc::now(),
+                        level: failure_level(f.status),
+                        api: api.label().to_string(),
+                        requested_model: mapped_model.clone(),
+                        resolved_model: usage.resolved_model_id,
+                        account: acc_label,
+                        status: f.status,
+                        latency_ms: latency,
+                        input_tokens: usage.prompt_tokens,
+                        output_tokens: usage.completion_tokens,
+                        cached_tokens: usage.cached_tokens,
+                        context: usage.context,
+                        message: format!("HTTP {}: {}", f.status, f.message),
+                    },
+                );
 
                 let should_failover = matches!(f.status, 401 | 403 | 429 | 502 | 504);
                 last_failure = Some(f);
@@ -546,7 +651,19 @@ async fn execute_with_pool(
     }
 
     if let Some(f) = last_failure {
-        api.error(f.status, &f.message, &f.code, f.retry_after_secs)
+        let retry = if f.status == 429 {
+            pool.next_cooldown_retry().or(f.retry_after_secs)
+        } else {
+            f.retry_after_secs
+        };
+        api.error(f.status, &f.message, &f.code, retry)
+    } else if let Some(retry) = pool.next_cooldown_retry() {
+        api.error(
+            429,
+            "Amazon Quick accounts are cooling down",
+            "rate_limit_exceeded",
+            Some(retry),
+        )
     } else {
         api.error(401, SIGN_IN_MSG, "authentication_error", None)
     }

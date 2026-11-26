@@ -1,6 +1,6 @@
 //! Anthropic Messages API 适配层（`POST /v1/messages` 与 `/v1/messages/count_tokens`，供 Claude Code 使用）。
 
-use crate::chat::{ChatOutput, NormalizedUsage, TurnEvent};
+use crate::chat::{ChatFailure, ChatOutput, NormalizedUsage, TurnEvent};
 use crate::messages::agent_neutral;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
-pub fn error_response(status: u16, message: &str) -> Response {
-    let err_type = match status {
+fn error_type(status: u16) -> &'static str {
+    match status {
         400 => "invalid_request_error",
         401 => "authentication_error",
         403 => "permission_error",
@@ -21,13 +21,16 @@ pub fn error_response(status: u16, message: &str) -> Response {
         429 => "rate_limit_error",
         529 => "overloaded_error",
         _ => "api_error",
-    };
+    }
+}
+
+pub fn error_response(status: u16, message: &str) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     (
         code,
         axum::Json(json!({
             "type": "error",
-            "error": { "type": err_type, "message": message }
+            "error": { "type": error_type(status), "message": message }
         })),
     )
         .into_response()
@@ -379,7 +382,7 @@ pub fn count_tokens(body: &Value) -> Response {
 pub fn from_chat_output(
     output: ChatOutput,
     req: &AnthropicRequest,
-    on_done: impl FnOnce(Option<NormalizedUsage>) + Send + 'static,
+    on_done: impl FnOnce(Result<NormalizedUsage, ChatFailure>) + Send + 'static,
 ) -> Response {
     let msg_id = format!("msg_{}", Uuid::new_v4().simple());
     let model = req.model.clone();
@@ -408,7 +411,7 @@ pub fn from_chat_output(
                 "tool_use"
             };
             let usage = usage_json(&res.usage);
-            on_done(Some(res.usage));
+            on_done(Ok(res.usage));
             axum::Json(json!({
                 "id": msg_id,
                 "type": "message",
@@ -450,7 +453,6 @@ pub fn from_chat_output(
                 let mut index: i32 = -1;
                 let mut open: &'static str = "";
                 let mut calls = 0usize;
-                let mut final_usage: Option<NormalizedUsage> = None;
 
                 let close_block = |open: &mut &'static str, index: i32| {
                     if open.is_empty() {
@@ -482,7 +484,10 @@ pub fn from_chat_output(
                     );
                 };
 
-                while let Some(ev) = started.rx.recv().await {
+                let outcome = loop {
+                    let Some(ev) = started.rx.recv().await else {
+                        break Err(ChatFailure::incomplete());
+                    };
                     match ev {
                         TurnEvent::Reasoning(r) => {
                             if !show_thinking {
@@ -516,14 +521,7 @@ pub fn from_chat_output(
                                 &json!({ "type": "content_block_delta", "index": index, "delta": { "type": "input_json_delta", "partial_json": partial } }),
                             );
                         }
-                        TurnEvent::Error(msg) => {
-                            close_block(&mut open, index);
-                            send(
-                                "error",
-                                &json!({ "type": "error", "error": { "type": "api_error", "message": msg } }),
-                            );
-                            break;
-                        }
+                        TurnEvent::Error(failure) => break Err(failure),
                         TurnEvent::Done(u) => {
                             close_block(&mut open, index);
                             let stop_reason = if calls > 0 { "tool_use" } else { "end_turn" };
@@ -536,12 +534,18 @@ pub fn from_chat_output(
                                 }),
                             );
                             send("message_stop", &json!({ "type": "message_stop" }));
-                            final_usage = Some(u);
-                            break;
+                            break Ok(u);
                         }
                     }
+                };
+                if let Err(failure) = &outcome {
+                    close_block(&mut open, index);
+                    send(
+                        "error",
+                        &json!({ "type": "error", "error": { "type": error_type(failure.status), "message": failure.message } }),
+                    );
                 }
-                on_done(final_usage);
+                on_done(outcome);
             });
 
             let stream = UnboundedReceiverStream::new(rx).boxed();

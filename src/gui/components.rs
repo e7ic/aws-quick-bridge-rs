@@ -7,13 +7,12 @@ use super::{
 use crate::qbs::QuotaWindow;
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    Animation, AnimationExt, AnyElement, AnyView, App, Bounds, BoxShadow, ContentMask, Context,
-    Corners, Div, FontWeight, Hsla, ImageSource, ObjectFit, PathBuilder, Pixels, Resource,
-    SharedString, Svg, Transformation, Window, canvas, div, fill, img, linear_color_stop,
-    linear_gradient, pattern_slash, point, prelude::*, pulsating_between, px, radians, relative,
-    rgb, rgba, size, svg,
+    AnyElement, AnyView, App, Bounds, BoxShadow, ContentMask, Context, Corners, Div, FontWeight,
+    Hsla, ImageSource, ObjectFit, PathBuilder, Pixels, Resource, SharedString, Svg, Transformation,
+    Window, canvas, div, fill, img, linear_color_stop, linear_gradient, pattern_slash, point,
+    prelude::*, px, radians, relative, rgb, rgba, size, svg,
 };
-use std::f32::consts::FRAC_PI_4;
+use std::f32::consts::{FRAC_PI_4, TAU};
 use std::time::Duration;
 
 const CARD_RADIUS: f32 = 13.0;
@@ -307,6 +306,7 @@ pub(super) enum BtnVariant {
     Primary,
     Secondary,
     Ghost,
+    Text(Hsla),
     SoftSuccess,
     SoftBlue,
     SoftDanger,
@@ -486,62 +486,39 @@ impl BridgeApp {
         highlight: Hsla,
         draw: impl Fn(&mut Window, Bounds<Pixels>, Shimmer) + Copy + 'static,
     ) -> AnyElement {
-        if motion::is_reduced_motion() {
-            return div()
-                .absolute()
-                .inset_0()
-                .child(
-                    canvas(
-                        |_, _, _| (),
-                        move |bounds, (), window, _| {
-                            draw(
-                                window,
-                                bounds,
-                                Shimmer {
-                                    peak: bounds.left() - px(1.0),
-                                    feather: px(0.0),
-                                    base,
-                                    highlight,
-                                },
-                            );
-                        },
-                    )
-                    .size_full(),
-                )
-                .into_any_element();
-        }
-        div()
-            .absolute()
-            .inset_0()
-            .with_animation(
-                id.into(),
-                Animation::new(Duration::from_millis(1400)).repeat(),
-                move |el, phase| {
-                    el.child(
-                        canvas(
-                            |_, _, _| (),
-                            move |bounds, (), window, _| {
-                                let width = bounds.size.width;
-                                let feather = width * 0.32;
-                                let peak =
-                                    bounds.left() - feather + (width + feather * 2.0) * phase;
-                                draw(
-                                    window,
-                                    bounds,
-                                    Shimmer {
-                                        peak,
-                                        feather,
-                                        base,
-                                        highlight,
-                                    },
-                                );
+        let layer = move |phase: Option<f32>| {
+            div().absolute().inset_0().child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, (), window, _| {
+                        let feather = phase.map_or(px(0.0), |_| bounds.size.width * 0.32);
+                        let peak = phase.map_or(bounds.left() - px(1.0), |phase| {
+                            let sweep = (phase / 0.82).min(1.0);
+                            bounds.left() - feather + (bounds.size.width + feather * 2.0) * sweep
+                        });
+                        draw(
+                            window,
+                            bounds,
+                            Shimmer {
+                                peak,
+                                feather,
+                                base,
+                                highlight,
                             },
-                        )
-                        .size_full(),
-                    )
-                },
+                        );
+                    },
+                )
+                .size_full(),
             )
-            .into_any_element()
+        };
+        if motion::is_reduced_motion() {
+            return layer(None).into_any_element();
+        }
+        motion::timeline(id.into(), Duration::from_millis(1450), move |phase| {
+            layer(Some(phase))
+        })
+        .repeat()
+        .into_any_element()
     }
 
     pub(super) fn shimmer_overlay(
@@ -647,6 +624,7 @@ impl BridgeApp {
             ),
             BtnVariant::Secondary => (t.bg_card, t.bg_hover, t.text_primary, t.border_strong),
             BtnVariant::Ghost => (transparent, t.bg_hover, t.text_secondary, transparent),
+            BtnVariant::Text(color) => (transparent, transparent, color, transparent),
             BtnVariant::SoftSuccess => (t.green_soft, t.green_soft, t.green_text, t.green_border),
             BtnVariant::SoftBlue => (t.blue_soft, t.blue_soft, t.blue_text, transparent),
             BtnVariant::SoftDanger => (t.red_soft, t.red_soft, t.red_text, transparent),
@@ -655,7 +633,7 @@ impl BridgeApp {
             }
             BtnVariant::Disabled => (t.bg_well, t.bg_well, t.text_muted, t.border_subtle),
         };
-        div()
+        let button = div()
             .id(id_ss.clone())
             .flex()
             .items_center()
@@ -673,6 +651,7 @@ impl BridgeApp {
             .text_size(px(12.5))
             .font_weight(FontWeight::NORMAL)
             .whitespace_nowrap()
+            .when(matches!(variant, BtnVariant::Text(_)), |el| el.opacity(0.8))
             .when(is_primary, |el| {
                 el.bg(linear_gradient(
                     90.0,
@@ -688,13 +667,6 @@ impl BridgeApp {
                     .when(t.keyboard_focus, |el| {
                         el.focus(move |s| s.border_color(t.series_blue))
                     })
-                    .hover(move |s| match variant {
-                        BtnVariant::Ghost => s.bg(hover_bg).text_color(t.text_primary),
-                        BtnVariant::Primary => s.shadow_sm(),
-                        BtnVariant::Secondary => s.bg(hover_bg),
-                        _ => s.opacity(0.86),
-                    })
-                    .active(move |s| s.opacity(if is_primary { 0.9 } else { 0.74 }))
             })
             .when(loading, |el| {
                 el.relative().child(Self::shimmer_overlay(
@@ -709,8 +681,23 @@ impl BridgeApp {
                     on_click(this, window, cx);
                     cx.notify();
                 }))
-            })
-            .into_any_element()
+            });
+        if !interactive {
+            return motion::layout(button).into_any_element();
+        }
+        let button = motion::control_feedback(button, move |style, hover, press| {
+            let opacity = match variant {
+                BtnVariant::Ghost | BtnVariant::Secondary => {
+                    style.background = Some(motion::lerp_hsla(bg, hover_bg, hover).into());
+                    1.0
+                }
+                BtnVariant::Primary => 1.0 - 0.02 * hover,
+                BtnVariant::Text(_) => 0.8 + 0.2 * hover,
+                _ => 1.0 - 0.045 * hover,
+            };
+            style.opacity = Some(opacity * (1.0 - 0.10 * press));
+        });
+        motion::layout(button).into_any_element()
     }
 
     pub(super) fn toggle_switch(
@@ -735,7 +722,7 @@ impl BridgeApp {
                 let stretch = travel_mid * 2.5;
                 let knob_w = 16.0 + stretch;
                 let knob_x = 2.0 + p * (16.0 - stretch);
-                div()
+                let switch = div()
                     .id(id_ss)
                     .relative()
                     .w(px(38.0))
@@ -751,8 +738,6 @@ impl BridgeApp {
                         el.focus(move |s| s.border_color(t.series_blue))
                     })
                     .cursor_pointer()
-                    .hover(|s| s.opacity(0.92))
-                    .active(|s| s.opacity(0.82))
                     .child(
                         div()
                             .absolute()
@@ -764,7 +749,10 @@ impl BridgeApp {
                             .bg(rgb(0xffffff))
                             .shadow_xs(),
                     )
-                    .on_click(on_click)
+                    .on_click(on_click);
+                motion::layout(motion::control_feedback(switch, |style, hover, press| {
+                    style.opacity = Some(1.0 - 0.025 * hover - 0.10 * press);
+                }))
             },
         )
         .into_any_element()
@@ -778,7 +766,8 @@ impl BridgeApp {
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> SegItem {
-        let mut el = div()
+        let resting_opacity = if selected { 1.0 } else { 0.72 };
+        let el = div()
             .id(id.into())
             .px(px(11.0))
             .py(px(4.0))
@@ -795,22 +784,17 @@ impl BridgeApp {
             .font_weight(FontWeight::MEDIUM)
             .whitespace_nowrap()
             .cursor_pointer()
-            .text_color(if selected {
-                t.text_primary
-            } else {
-                t.text_muted
-            })
-            .active(|s| s.opacity(0.76));
-        if !selected {
-            el = el.hover(move |s| s.text_color(t.text_primary));
-        }
-        let element = el
+            .text_color(t.text_primary)
             .child(label.into())
             .on_click(cx.listener(move |this, _, window, cx| {
                 on_click(this, window, cx);
                 cx.notify();
-            }))
-            .into_any_element();
+            }));
+        let element = motion::layout(motion::control_feedback(el, move |style, hover, press| {
+            let opacity = resting_opacity + (1.0 - resting_opacity) * hover;
+            style.opacity = Some(opacity * (1.0 - 0.09 * press));
+        }))
+        .into_any_element();
         SegItem { selected, element }
     }
 
@@ -821,7 +805,7 @@ impl BridgeApp {
     ) -> AnyElement {
         let selected = items.iter().position(|item| item.selected);
         let children = items.into_iter().map(|item| item.element).collect();
-        motion::sliding_track(
+        let track = motion::sliding_track(
             id.into(),
             selected,
             SlidingTrackStyle {
@@ -842,8 +826,8 @@ impl BridgeApp {
                 }),
             },
             children,
-        )
-        .into_any_element()
+        );
+        motion::layout(track).into_any_element()
     }
 
     pub(super) fn filter_chip(
@@ -855,7 +839,7 @@ impl BridgeApp {
         on_click: impl Fn(&mut Self) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
+        let chip = div()
             .id(id.into())
             .flex()
             .items_center()
@@ -875,14 +859,6 @@ impl BridgeApp {
             .when(t.keyboard_focus, |el| {
                 el.focus(move |style| style.border_color(t.series_blue))
             })
-            .hover(move |s| {
-                if selected {
-                    s.bg(t.cta_hover)
-                } else {
-                    s.bg(t.bg_hover).border_color(t.border_strong)
-                }
-            })
-            .active(|s| s.opacity(0.78))
             .child(label)
             .child(
                 div()
@@ -894,8 +870,20 @@ impl BridgeApp {
             .on_click(cx.listener(move |this, _, _, cx| {
                 on_click(this);
                 cx.notify();
-            }))
-            .into_any_element()
+            }));
+        motion::layout(motion::control_feedback(
+            chip,
+            move |style, hover, press| {
+                let (bg, hovered) = if selected {
+                    (t.cta_bg, t.cta_hover)
+                } else {
+                    (t.bg_well, t.bg_hover)
+                };
+                style.background = Some(motion::lerp_hsla(bg, hovered, hover).into());
+                style.opacity = Some(1.0 - 0.10 * press);
+            },
+        ))
+        .into_any_element()
     }
 
     pub(super) fn pill(
@@ -925,13 +913,10 @@ impl BridgeApp {
             let dot = div().size(px(5.5)).rounded_full().bg(dc);
             if let Some(pid) = pulse_id.filter(|_| !motion::is_reduced_motion()) {
                 el = el.child(
-                    dot.with_animation(
-                        pid,
-                        Animation::new(Duration::from_millis(1800))
-                            .repeat()
-                            .with_easing(pulsating_between(0.35, 1.0)),
-                        |d, alpha| d.opacity(alpha),
-                    ),
+                    motion::timeline(pid, Duration::from_millis(2000), move |phase| {
+                        dot.opacity(0.9 + 0.1 * (phase * TAU).cos())
+                    })
+                    .repeat(),
                 );
             } else {
                 el = el.child(dot);
@@ -1192,7 +1177,7 @@ impl BridgeApp {
 
     pub(super) fn value_with_unit(
         t: Theme,
-        value: String,
+        value: impl IntoElement,
         unit: Option<&'static str>,
         font_size: f32,
         color: Hsla,
@@ -1214,15 +1199,16 @@ impl BridgeApp {
                     .child(value),
             )
             .when_some(unit, |el, unit| {
-                el.child(
+                el.child(motion::layout(
                     div()
+                        .id("metric-unit")
                         .flex_shrink_0()
                         .mb(px(1.0))
                         .text_size(px(11.0))
                         .line_height(px(12.0))
                         .text_color(t.text_muted)
                         .child(unit),
-                )
+                ))
             })
     }
 
@@ -1286,6 +1272,7 @@ impl BridgeApp {
         quota: &QuotaWindow,
         history: &[QuotaReading],
         updated_at: Option<DateTime<Utc>>,
+        loading: bool,
         id: impl Into<SharedString>,
     ) -> AnyElement {
         let (label, accent) = match quota.name.as_str() {
@@ -1297,7 +1284,7 @@ impl BridgeApp {
         let (remaining, credits) = quota_remaining(quota);
         let percent = quota_percent(remaining);
         let has_credits = credits.is_some();
-        let value = credits.unwrap_or_else(|| percent.clone());
+        let value = credits.map_or_else(|| percent.clone(), format_quota_credits);
         let (percent_color, dot_color) = if remaining <= 0.10 {
             (t.red_text, t.red)
         } else if remaining <= 0.28 {
@@ -1305,6 +1292,65 @@ impl BridgeApp {
         } else {
             (t.text_muted, accent)
         };
+        let amount = div()
+            .id("current-quota")
+            .flex()
+            .items_center()
+            .justify_between()
+            .h(px(32.0))
+            .gap(px(6.0))
+            .child(Self::value_with_unit(
+                t,
+                motion::rolling_number(
+                    if has_credits { "credits" } else { "percentage" },
+                    value,
+                    credits.unwrap_or(remaining),
+                )
+                .pause(loading),
+                has_credits.then_some("credits"),
+                20.0,
+                if remaining == 0.0 {
+                    t.red_text
+                } else {
+                    t.text_primary
+                },
+            ));
+        let values = div().flex().flex_col().child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(4.0))
+                .text_size(px(11.5))
+                .text_color(t.text_muted)
+                .child(div().min_w(px(0.0)).truncate().child(label.to_owned()))
+                .when(has_credits, |el| {
+                    el.child(
+                        div()
+                            .flex_shrink_0()
+                            .font(numeric_font())
+                            .text_color(percent_color)
+                            .child(
+                                motion::rolling_number("remaining", percent, remaining)
+                                    .pause(loading),
+                            ),
+                    )
+                }),
+        );
+        let frame = Self::quota_metric_frame().id(id.into()).relative();
+        if loading {
+            // Keep the previous values mounted so the refresh can roll from them.
+            return motion::layout(
+                frame.child(values.opacity(0.0).child(amount)).child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(Self::quota_balance_skeleton(t, "loading")),
+                ),
+            )
+            .into_any_element();
+        }
+
         let used = if has_credits {
             quota.display.clone()
         } else {
@@ -1344,53 +1390,18 @@ impl BridgeApp {
                 latest.at.with_timezone(&Local).format("%m-%d %H:%M"),
             ));
         }
-        Self::quota_metric_frame()
-            .id(id.into())
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(4.0))
-                    .text_size(px(11.5))
-                    .text_color(t.text_muted)
-                    .child(div().min_w(px(0.0)).truncate().child(label.to_owned()))
-                    .when(has_credits, |el| {
-                        el.child(
-                            div()
-                                .flex_shrink_0()
-                                .font(numeric_font())
-                                .text_color(percent_color)
-                                .child(percent),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .id("current-quota")
-                    .tooltip(Self::text_tooltip(t, tooltip))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .h(px(32.0))
-                    .gap(px(6.0))
-                    .child(Self::value_with_unit(
-                        t,
-                        value,
-                        has_credits.then_some("credits"),
-                        20.0,
-                        if remaining == 0.0 {
-                            t.red_text
-                        } else {
-                            t.text_primary
-                        },
-                    ))
-                    .child(quota_dots(t, remaining, dot_color)),
-            )
-            .child(Self::quota_sparkline(t, accent, trend))
-            .into_any_element()
+        motion::layout(
+            frame.child(
+                values
+                    .child(
+                        amount
+                            .tooltip(Self::text_tooltip(t, tooltip))
+                            .child(quota_dots(t, remaining, dot_color)),
+                    )
+                    .child(Self::quota_sparkline(t, accent, trend)),
+            ),
+        )
+        .into_any_element()
     }
 }
 
@@ -1430,11 +1441,8 @@ fn quota_remaining_ratio(quota: &QuotaWindow) -> f64 {
     (1.0 - used).clamp(0.0, 1.0)
 }
 
-fn quota_remaining(quota: &QuotaWindow) -> (f64, Option<String>) {
-    (
-        quota_remaining_ratio(quota),
-        quota_credits(quota).map(format_quota_credits),
-    )
+fn quota_remaining(quota: &QuotaWindow) -> (f64, Option<f64>) {
+    (quota_remaining_ratio(quota), quota_credits(quota))
 }
 
 fn quota_credits(quota: &QuotaWindow) -> Option<f64> {
@@ -1495,8 +1503,9 @@ mod tests {
     fn card_quota_shows_remaining_credits_and_percent() {
         assert_eq!(
             quota_remaining(&quota(62.5, 100.0, None)),
-            (0.375, Some("37.5".into()))
+            (0.375, Some(37.5))
         );
+        assert_eq!(format_quota_credits(37.5), "37.5");
         assert_eq!(quota_remaining(&quota(0.0, 0.0, Some(75.0))), (0.25, None));
     }
 
@@ -1523,11 +1532,12 @@ mod tests {
         assert_eq!(quota_percent(0.25), "25%");
         assert_eq!(
             quota_remaining(&quota(105.0, 100.0, None)),
-            (0.0, Some("0".into()))
+            (0.0, Some(0.0))
         );
+        assert_eq!(format_quota_credits(0.0), "0");
         let (remaining, value) = quota_remaining(&quota(99.999, 100.0, None));
         assert!(remaining > 0.0);
-        assert_eq!(value.as_deref(), Some("<0.01"));
+        assert_eq!(value.map(format_quota_credits).as_deref(), Some("<0.01"));
         assert_eq!(quota_percent(remaining), "<1%");
     }
 }

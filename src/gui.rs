@@ -23,7 +23,7 @@ use anyhow::{Context as _, Result};
 use chrono::Utc;
 use gpui::{
     App, AppContext, Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Font,
-    FontFallbacks, ImageSource, ScrollHandle, SharedString, Timer, TitlebarOptions,
+    FontFallbacks, FontFeatures, ImageSource, ScrollHandle, SharedString, Timer, TitlebarOptions,
     WindowAppearance, WindowBounds, WindowOptions, font, point, px, size,
 };
 use parking_lot::Mutex;
@@ -277,6 +277,7 @@ fn configure_fonts(cx: &App, fonts: Vec<Cow<'static, [u8]>>) {
     NUMERIC_FONT.get_or_init(|| {
         let families = text_system.all_font_names();
         let mut numbers = ui_font();
+        numbers.features = FontFeatures(Arc::new(vec![("tnum".into(), 1)]));
         let family = ["DIN", "DIN Alternate", "Bahnschrift"]
             .into_iter()
             .find(|family| families.iter().any(|available| available == *family));
@@ -1173,6 +1174,7 @@ impl BridgeApp {
                     input_tokens: res.usage.prompt,
                     output_tokens: res.usage.completion,
                     cached_tokens: res.usage.cache_read,
+                    context: res.usage.context,
                     message: format!("{model} -> {resolved}"),
                 });
                 Ok::<String, anyhow::Error>(resolved)

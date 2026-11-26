@@ -1,6 +1,6 @@
 //! OpenAI Responses API 适配层（`POST /v1/responses`，供 Codex 使用）。
 
-use crate::chat::{ChatOutput, NormalizedUsage, TurnEvent};
+use crate::chat::{ChatFailure, ChatOutput, NormalizedUsage, TurnEvent};
 use crate::toolbridge::ToolCallReply;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -502,7 +502,7 @@ fn message_item(id: String, text: &str) -> Value {
 pub fn from_chat_output(
     output: ChatOutput,
     req: ResponsesRequest,
-    on_done: impl FnOnce(Option<NormalizedUsage>) + Send + 'static,
+    on_done: impl FnOnce(Result<NormalizedUsage, ChatFailure>) + Send + 'static,
 ) -> Response {
     let base = json!({
         "id": make_id("resp_"),
@@ -533,7 +533,7 @@ pub fn from_chat_output(
             resp["output"] = Value::Array(items);
             resp["output_text"] = json!(res.text);
             resp["usage"] = usage_json(&res.usage);
-            on_done(Some(res.usage));
+            on_done(Ok(res.usage));
             axum::Json(resp).into_response()
         }
         ChatOutput::Stream(mut started) => {
@@ -567,7 +567,6 @@ pub fn from_chat_output(
                     text: String,
                 }
                 let mut open: Option<OpenItem> = None;
-                let mut final_usage: Option<NormalizedUsage> = None;
 
                 let close_item = |open: &mut Option<OpenItem>, items: &mut Vec<Value>, send: &mut dyn FnMut(&str, Value)| {
                     let Some(cur) = open.take() else { return };
@@ -600,7 +599,10 @@ pub fn from_chat_output(
                     items.push(finished);
                 };
 
-                while let Some(ev) = started.rx.recv().await {
+                let outcome = loop {
+                    let Some(ev) = started.rx.recv().await else {
+                        break Err(ChatFailure::incomplete());
+                    };
                     match ev {
                         TurnEvent::Reasoning(t) => {
                             let kind = "reasoning";
@@ -701,16 +703,7 @@ pub fn from_chat_output(
                             );
                             items.push(item);
                         }
-                        TurnEvent::Error(msg) => {
-                            close_item(&mut open, &mut items, &mut send);
-                            let mut failed = base.clone();
-                            failed["status"] = json!("failed");
-                            failed["output"] = Value::Array(items.clone());
-                            failed["usage"] = Value::Null;
-                            failed["error"] = json!({ "code": "server_error", "message": msg });
-                            send("response.failed", json!({ "response": failed }));
-                            break;
-                        }
+                        TurnEvent::Error(failure) => break Err(failure),
                         TurnEvent::Done(u) => {
                             close_item(&mut open, &mut items, &mut send);
                             let mut done_resp = base.clone();
@@ -718,12 +711,25 @@ pub fn from_chat_output(
                             done_resp["output"] = Value::Array(items.clone());
                             done_resp["usage"] = usage_json(&u);
                             send("response.completed", json!({ "response": done_resp }));
-                            final_usage = Some(u);
-                            break;
+                            break Ok(u);
                         }
                     }
+                };
+                if let Err(failure) = &outcome {
+                    close_item(&mut open, &mut items, &mut send);
+                    let mut failed = base;
+                    failed["status"] = json!("failed");
+                    failed["output"] = Value::Array(items);
+                    failed["usage"] = Value::Null;
+                    let code = if failure.status == 429 {
+                        "rate_limit_exceeded"
+                    } else {
+                        "server_error"
+                    };
+                    failed["error"] = json!({ "code": code, "message": failure.message });
+                    send("response.failed", json!({ "response": failed }));
                 }
-                on_done(final_usage);
+                on_done(outcome);
             });
 
             let stream = UnboundedReceiverStream::new(rx).boxed();

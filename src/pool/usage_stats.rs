@@ -1,6 +1,7 @@
 use super::RequestLogEntry;
 use super::request_stats::{RequestProtocol, RequestSample};
 use crate::config::write_secure_file;
+use crate::upstream::ContextUsage;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Days, Local, NaiveDate, Timelike, Utc};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
@@ -8,7 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read};
+use std::io::{BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,15 +56,32 @@ struct AccountLabel {
 
 type UsageBuckets = BTreeMap<UsageBucket, UsageTotals>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContextSample {
+    #[serde(with = "chrono::serde::ts_milliseconds")]
+    pub(crate) timestamp: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) usage: Option<ContextUsage>,
+}
+
+type ContextBuckets = BTreeMap<UsageBucket, Vec<ContextSample>>;
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct UsageHistory {
     pub(crate) started_on: Option<NaiveDate>,
     accounts: BTreeMap<String, AccountLabel>,
     #[serde(
-        serialize_with = "serialize_buckets",
-        deserialize_with = "deserialize_buckets"
+        serialize_with = "serialize_entries",
+        deserialize_with = "deserialize_entries"
     )]
     pub(crate) buckets: UsageBuckets,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        serialize_with = "serialize_entries",
+        deserialize_with = "deserialize_entries"
+    )]
+    pub(crate) contexts: ContextBuckets,
 }
 
 impl UsageHistory {
@@ -82,12 +100,28 @@ impl UsageHistory {
         }
     }
 
-    fn record(&mut self, bucket: UsageBucket, label: &AccountLabel, totals: UsageTotals) {
+    fn record(
+        &mut self,
+        bucket: UsageBucket,
+        label: &AccountLabel,
+        totals: UsageTotals,
+        context: Option<ContextSample>,
+    ) {
         self.started_on = Some(
             self.started_on
                 .map_or(bucket.date, |date| date.min(bucket.date)),
         );
         self.update_label(&bucket.account, label);
+        if let Some(context) = context {
+            // Share account, model and protocol across all samples in one day.
+            let key = UsageBucket {
+                hour: None,
+                ..bucket.clone()
+            };
+            let samples = self.contexts.entry(key).or_default();
+            let index = samples.partition_point(|sample| sample.timestamp <= context.timestamp);
+            samples.insert(index, context);
+        }
         self.buckets.entry(bucket).or_default().add(totals);
     }
 
@@ -101,10 +135,16 @@ impl UsageHistory {
         for (bucket, totals) in &delta.buckets {
             self.buckets.entry(bucket.clone()).or_default().add(*totals);
         }
+        for (bucket, samples) in &delta.contexts {
+            let target = self.contexts.entry(bucket.clone()).or_default();
+            target.extend_from_slice(samples);
+            target.sort_unstable_by_key(|sample| sample.timestamp);
+        }
     }
 
     fn compact(&mut self, today: NaiveDate) {
         let oldest = today - Days::new(USAGE_RETENTION_DAYS - 1);
+        self.contexts.retain(|bucket, _| bucket.date >= oldest);
         let mut daily = Vec::new();
         self.buckets.retain(|bucket, totals| {
             if bucket.date < oldest {
@@ -127,17 +167,22 @@ impl UsageHistory {
     }
 }
 
-fn serialize_buckets<S: Serializer>(
-    buckets: &UsageBuckets,
+fn serialize_entries<K: Serialize, V: Serialize, S: Serializer>(
+    entries: &BTreeMap<K, V>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    serializer.collect_seq(buckets)
+    serializer.collect_seq(entries)
 }
 
-fn deserialize_buckets<'de, D: Deserializer<'de>>(
+fn deserialize_entries<
+    'de,
+    K: Ord + Deserialize<'de>,
+    V: Deserialize<'de>,
+    D: Deserializer<'de>,
+>(
     deserializer: D,
-) -> Result<UsageBuckets, D::Error> {
-    let rows = Vec::<(UsageBucket, UsageTotals)>::deserialize(deserializer)?;
+) -> Result<BTreeMap<K, V>, D::Error> {
+    let rows = Vec::<(K, V)>::deserialize(deserializer)?;
     Ok(rows.into_iter().collect())
 }
 
@@ -196,9 +241,13 @@ impl UsageStore {
             output: sample.output_tokens,
             cache_read: entry.cached_tokens,
         };
+        let context = Some(ContextSample {
+            timestamp: sample.timestamp,
+            usage: entry.context,
+        });
         let mut state = self.state.lock();
-        Arc::make_mut(&mut state.visible).record(bucket.clone(), &label, totals);
-        state.pending.record(bucket, &label, totals);
+        Arc::make_mut(&mut state.visible).record(bucket.clone(), &label, totals, context);
+        state.pending.record(bucket, &label, totals, context);
     }
 
     pub(super) fn schedule_save(self: &Arc<Self>) {
@@ -268,9 +317,9 @@ fn read_cache(path: &Path) -> Result<UsageHistory> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(UsageHistory::default()),
         Err(error) => return Err(error.into()),
     };
-    let mut data = Vec::new();
-    GzDecoder::new(file).read_to_end(&mut data)?;
-    Ok(serde_json::from_slice(&data)?)
+    Ok(serde_json::from_reader(BufReader::new(GzDecoder::new(
+        file,
+    )))?)
 }
 
 #[cfg(test)]
@@ -312,7 +361,14 @@ mod tests {
         let (label, totals) = fixtures();
         for date in [expired, oldest, yesterday, today] {
             for hour in [3, 23] {
-                history.record(bucket(date, hour), &label, totals);
+                let context = ContextSample {
+                    timestamp: date.and_hms_opt(hour, 0, 0).unwrap().and_utc(),
+                    usage: Some(ContextUsage {
+                        used_tokens: Some(2_000),
+                        window_tokens: std::num::NonZeroU64::new(200_000),
+                    }),
+                };
+                history.record(bucket(date, hour), &label, totals, Some(context));
             }
         }
 
@@ -320,6 +376,14 @@ mod tests {
         assert_eq!(history.started_on, Some(expired));
         assert_eq!(history.buckets.len(), 4);
         assert!(history.buckets.keys().all(|row| row.date >= oldest));
+        assert_eq!(history.contexts.len(), 3);
+        assert!(
+            history
+                .contexts
+                .keys()
+                .all(|row| row.date >= oldest && row.hour.is_none())
+        );
+        assert_eq!(history.contexts.values().map(Vec::len).sum::<usize>(), 6);
         assert_eq!(history.buckets[&bucket(today, 3)], totals);
         for date in [oldest, yesterday] {
             let daily = UsageBucket {
@@ -350,7 +414,7 @@ mod tests {
         for store in [&first, &second] {
             let mut state = store.state.lock();
             for _ in 0..1_000 {
-                state.pending.record(key.clone(), &label, totals);
+                state.pending.record(key.clone(), &label, totals, None);
             }
         }
         first.save();
@@ -360,6 +424,7 @@ mod tests {
         let restored = UsageStore::load(path.clone());
         let state = restored.state.lock();
         assert_eq!(state.visible.buckets.len(), 1);
+        assert!(state.visible.contexts.is_empty());
         assert_eq!(
             state.visible.buckets[&key],
             UsageTotals {

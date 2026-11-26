@@ -16,7 +16,8 @@ const MAX_TOASTS: usize = 12;
 const STACK_BACK_LAYERS: usize = 2;
 const STACK_OFFSET: f32 = 7.0;
 const STACK_INSET: f32 = 5.0;
-const REFLOW_STAGGER: Duration = Duration::from_millis(42);
+const REFLOW_STAGGER: Duration = Duration::from_millis(32);
+const MAX_REFLOW_DELAY: Duration = Duration::from_millis(160);
 const REFLOW_SPRING: SpringConfig = SpringConfig {
     stiffness: 560.0,
     damping: 32.0,
@@ -187,7 +188,7 @@ impl ToastPositions {
                     if stacked_y < previous_stacked_y {
                         // 只延后需要补位的通知，每条保留自己的位移和速度。
                         slot.move_at = next_move_at;
-                        next_move_at += REFLOW_STAGGER;
+                        next_move_at = (next_move_at + REFLOW_STAGGER).min(now + MAX_REFLOW_DELAY);
                     } else if stacked_y > previous_stacked_y {
                         slot.move_at = now;
                     }
@@ -325,8 +326,34 @@ impl BridgeApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let width = px(if compact { 200.0 } else { 208.0 });
-        let right = px(if compact { 16.0 } else { 26.0 });
+        let now = motion::frame_time(window);
+        let target = if compact {
+            [200.0, 16.0]
+        } else {
+            [208.0, 26.0]
+        };
+        let ([width, right], resizing) =
+            window.with_global_id("toast-width".into(), |id, window| {
+                let tolerance = 0.5 / window.scale_factor();
+                window.with_element_state(id, |state: Option<MultiSpringState<2>>, _| {
+                    let mut state =
+                        state.unwrap_or_else(|| MultiSpringState::new(target, target, now));
+                    (
+                        state.advance_with_policy(
+                            target,
+                            now,
+                            SpringConfig::SMOOTH,
+                            Some(tolerance),
+                            motion::is_reduced_motion(),
+                        ),
+                        state,
+                    )
+                })
+            });
+        if resizing {
+            motion::request_frame(window);
+        }
+        let (width, right) = (px(width), px(right));
         let text_width =
             width - px(2.0) - (HORIZONTAL_PADDING + CONTENT_GAP) * 2.0 - ICON_SIZE - CLOSE_SIZE;
         let available_height = (window.viewport_size().height - top).max(px(0.0));
@@ -370,17 +397,13 @@ impl BridgeApp {
             let pixel_tolerance = 0.5 / window.scale_factor();
             window.with_element_state(id, |state: Option<ToastPositions>, _| {
                 let mut state = state.unwrap_or_default();
-                let frame = state.advance(
-                    &items,
-                    Instant::now(),
-                    pixel_tolerance,
-                    motion::is_reduced_motion(),
-                );
+                let frame =
+                    state.advance(&items, now, pixel_tolerance, motion::is_reduced_motion());
                 (frame, state)
             })
         });
         if moving {
-            window.request_animation_frame();
+            motion::request_frame(window);
         }
         let layers: Vec<_> = items
             .into_iter()
