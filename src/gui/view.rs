@@ -2764,7 +2764,11 @@ impl BridgeApp {
                     .child(Self::setting_row(
                         t,
                         "关闭窗口行为",
-                        "收起到后台，网关继续运行",
+                        if cfg!(target_os = "macos") {
+                            "收起到菜单栏，网关继续运行"
+                        } else {
+                            "收起到后台，网关继续运行"
+                        },
                         Self::pill(
                             "后台常驻",
                             t.text_secondary,
