@@ -26,6 +26,7 @@ pub(crate) const CLAUDE_ROLE_MODES: &[(&str, &str)] = &[
     ("opus", "smart"),
     ("haiku", "fast"),
 ];
+pub(crate) const CLAUDE_DESKTOP_AUTO_ID: &str = "claude-auto-bridge";
 
 pub fn model_display_name(id: &str) -> String {
     match id {
@@ -122,6 +123,9 @@ pub(crate) fn resolve_quick_model(requested: &str) -> Option<&'static str> {
     let id = normalized_model_id(requested);
     if let Some(mode) = explicit_quick_mode(&id) {
         return Some(mode);
+    }
+    if id == CLAUDE_DESKTOP_AUTO_ID {
+        return Some("auto");
     }
 
     // 兼容现代 Claude ID、旧版日期 ID 和 Bedrock 推理配置 ID。

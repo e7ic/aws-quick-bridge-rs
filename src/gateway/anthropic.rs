@@ -274,12 +274,17 @@ pub fn to_chat(body: &Value) -> AnthropicRequest {
     });
 
     if let Some(tools_arr) = body.get("tools").and_then(|v| v.as_array()) {
+        // Quick 没有原生工具搜索，直接加载本轮允许直接调用的工具定义。
         let converted: Vec<Value> = tools_arr
             .iter()
             .filter(|t| {
                 t.get("name").and_then(|v| v.as_str()).is_some()
                     && t.get("input_schema").is_some()
-                    && t.get("defer_loading").and_then(|v| v.as_bool()) != Some(true)
+                    && t.get("allowed_callers").is_none_or(|callers| {
+                        callers
+                            .as_array()
+                            .is_some_and(|list| list.iter().any(|v| v == "direct"))
+                    })
             })
             .map(|t| {
                 json!({

@@ -405,8 +405,13 @@ mod tests {
         );
         let original_profile = fs::read(&other_profile).unwrap();
 
-        let first =
+        let mut first =
             native_configuration("http://127.0.0.1:18765/claude-desktop", "test-key", "fast");
+        first["inferenceModels"] = json!([
+            {"name": "fast", "labelOverride": "Quick Fast"},
+            {"name": "smart", "labelOverride": "Quick Smart"},
+            {"name": "balanced", "labelOverride": "Quick Balanced"}
+        ]);
         files.apply(&first).unwrap();
         assert_eq!(read(&files.meta)[APPLIED], PROFILE_ID);
         assert_eq!(read(&files.normal)[MODE], "3p");

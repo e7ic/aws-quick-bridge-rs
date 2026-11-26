@@ -46,6 +46,16 @@ pub struct ToolCallReply {
     pub arguments: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ToolCallError {
+    #[error("Amazon Quick returned an incomplete tool call. Try again.")]
+    Incomplete,
+    #[error("Amazon Quick returned invalid tool call data. Try again.")]
+    Invalid,
+    #[error("Amazon Quick requested a tool outside the client's current tool list. Try again.")]
+    Unavailable,
+}
+
 pub fn tool_definitions(tools: Option<&[Value]>, functions: Option<&[Value]>) -> Vec<ToolDef> {
     let mut defs = Vec::new();
     let mut add = |f: Option<&Value>| {
@@ -133,18 +143,16 @@ pub fn parse_tool_choice(value: Option<&Value>) -> ToolChoice {
     }
 }
 
-fn type_of(schema: Option<&Value>, depth: usize) -> String {
+fn type_of(schema: Option<&Value>) -> String {
     let Some(obj) = schema.and_then(|v| v.as_object()) else {
         return "any".to_string();
     };
     if let Some(arr) = obj.get("enum").and_then(|v| v.as_array()) {
-        if arr.len() <= 8 {
-            return arr
-                .iter()
-                .map(|v| serde_json::to_string(v).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join("|");
-        }
+        return arr
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
     }
     let typ = match obj.get("type") {
         Some(Value::Array(arr)) => arr
@@ -156,14 +164,14 @@ fn type_of(schema: Option<&Value>, depth: usize) -> String {
         _ => "",
     };
     if typ == "array" {
-        return format!("{}[]", type_of(obj.get("items"), depth + 1));
+        return format!("{}[]", type_of(obj.get("items")));
     }
     if typ == "object" || obj.contains_key("properties") {
         let props = obj.get("properties").and_then(|v| v.as_object());
         let Some(props) = props else {
             return "object".to_string();
         };
-        if props.is_empty() || depth >= 2 {
+        if props.is_empty() {
             return "object".to_string();
         }
         let required: HashSet<&str> = obj
@@ -175,7 +183,7 @@ fn type_of(schema: Option<&Value>, depth: usize) -> String {
             .iter()
             .map(|(k, v)| {
                 let star = if required.contains(k.as_str()) { "*" } else { "" };
-                format!("{k}{star}: {}", type_of(Some(v), depth + 1))
+                format!("{k}{star}: {}", type_of(Some(v)))
             })
             .collect();
         return format!("{{{}}}", fields.join(", "));
@@ -202,7 +210,7 @@ fn signature(def: &ToolDef, about: usize) -> String {
                 .iter()
                 .map(|(k, v)| {
                     let star = if required.contains(k.as_str()) { "*" } else { "" };
-                    format!("{k}{star}: {}", type_of(Some(v), 1))
+                    format!("{k}{star}: {}", type_of(Some(v)))
                 })
                 .collect()
         })
@@ -253,7 +261,7 @@ fn names_only(defs: &[ToolDef]) -> String {
 fn listing(defs: &[ToolDef], detail: ToolDetail) -> String {
     match detail {
         ToolDetail::Names => format!(
-            "(names only: there are too many to describe here; take a tool's arguments from its name and from the task)\n{}",
+            "(tool names only. Call a tool only if you know its exact argument schema.)\n{}",
             names_only(defs)
         ),
         ToolDetail::Desc(about) => {
@@ -366,7 +374,7 @@ fn looks_like_value_start(chars: &[char], pos: usize) -> bool {
         return false;
     }
     match chars[pos] {
-        '"' | '{' | '[' | '-' | '0'..='9' => true,
+        '"' | '“' | '”' | '{' | '[' | '-' | '0'..='9' => true,
         't' => starts_with_keyword(chars, pos, "true"),
         'f' => starts_with_keyword(chars, pos, "false"),
         'n' => starts_with_keyword(chars, pos, "null"),
@@ -376,9 +384,11 @@ fn looks_like_value_start(chars: &[char], pos: usize) -> bool {
 
 /// 判断从 `pos` 开始是否为合法的对象字段键定义（`"key": <value>`）。
 fn looks_like_object_key_colon(chars: &[char], pos: usize) -> bool {
-    if pos >= chars.len() || chars[pos] != '"' {
-        return false;
-    }
+    let quote = match chars.get(pos) {
+        Some('"') => '"',
+        Some('“' | '”') => '”',
+        _ => return false,
+    };
     let mut j = pos + 1;
     let mut key_len = 0usize;
     while j < chars.len() {
@@ -391,7 +401,7 @@ fn looks_like_object_key_colon(chars: &[char], pos: usize) -> bool {
             key_len += 1;
             continue;
         }
-        if c == '"' {
+        if c == quote {
             if key_len == 0 {
                 return false;
             }
@@ -491,7 +501,7 @@ fn is_real_value_string_end(chars: &[char], pos: usize, stack: &[JsonContainer])
 
 /// 容错修复模型在 `<client_tool_call>` 内输出的不规范 JSON：
 /// 1. 去除误包在标签内的 Markdown 代码块围栏；
-/// 2. 自动转义字符串值中未转义的双引号（如 Shell 命令中的 `"$d"`）、非法反斜杠转义（如 `\d` / `\$`）与裸换行/控制字符；
+/// 2. 修正 JSON 字符串分隔用的弯引号，转义字符串里的双引号、非法反斜杠转义与裸控制字符；
 /// 3. 去除对象/数组末尾的多余逗号。
 fn repair_json_payload(raw: &str) -> String {
     let mut text = raw.trim();
@@ -565,7 +575,8 @@ fn repair_json_payload(raw: &str) -> String {
                 };
                 i += 1;
             }
-            '"' => {
+            '"' | '“' | '”' => {
+                let quote = if ch == '"' { '"' } else { '”' };
                 let is_key =
                     expect == JsonExpect::KeyOrEnd && stack.last() == Some(&JsonContainer::Object);
                 out.push('"');
@@ -597,7 +608,7 @@ fn repair_json_payload(raw: &str) -> String {
                         i += 1;
                         continue;
                     }
-                    if c == '"' {
+                    if c == quote {
                         let next_pos = skip_ws(&chars, i + 1);
                         let is_end = if is_key {
                             next_pos < chars.len() && chars[next_pos] == ':'
@@ -614,11 +625,9 @@ fn repair_json_payload(raw: &str) -> String {
                             };
                             break;
                         }
-                        out.push_str("\\\"");
-                        i += 1;
-                        continue;
                     }
                     match c {
+                        '"' => out.push_str("\\\""),
                         '\n' => out.push_str("\\n"),
                         '\r' => out.push_str("\\r"),
                         '\t' => out.push_str("\\t"),
@@ -675,60 +684,88 @@ fn parse_envelopes(payload: &str) -> Vec<Value> {
     }
 }
 
-fn replies_from(envelopes: Vec<Value>, allowed: &HashSet<String>) -> Vec<ToolCallReply> {
-    let mut out = Vec::new();
-    for env in envelopes {
-        let name = env
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if name.is_empty() || !allowed.contains(&name) {
-            continue;
-        }
-        out.push(ToolCallReply {
-            id: call_id(),
-            name,
-            arguments: argument_string(env.get("arguments")),
-        });
+fn replies_from(
+    envelopes: Vec<Value>,
+    allowed: &HashSet<String>,
+) -> Result<Vec<ToolCallReply>, ToolCallError> {
+    if envelopes.is_empty() {
+        return Err(ToolCallError::Invalid);
     }
-    out
+    envelopes
+        .into_iter()
+        .map(|env| {
+            let name = env["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .ok_or(ToolCallError::Invalid)?;
+            if !allowed.contains(name) {
+                return Err(ToolCallError::Unavailable);
+            }
+            let supplied = env.get("arguments");
+            let valid_arguments = match supplied {
+                None | Some(Value::Null | Value::Object(_)) => true,
+                Some(Value::String(s)) => {
+                    s.trim().is_empty()
+                        || serde_json::from_str::<Value>(s).is_ok_and(|value| value.is_object())
+                }
+                _ => false,
+            };
+            if !valid_arguments {
+                return Err(ToolCallError::Invalid);
+            }
+            Ok(ToolCallReply {
+                id: call_id(),
+                name: name.to_string(),
+                arguments: argument_string(supplied),
+            })
+        })
+        .collect()
 }
 
-pub fn extract_tool_calls(text: &str, allowed: &HashSet<String>) -> (String, Vec<ToolCallReply>) {
-    if allowed.is_empty() {
-        return (text.to_string(), Vec::new());
-    }
+fn extract_tool_calls(
+    text: &str,
+    allowed: &HashSet<String>,
+) -> Result<(String, Vec<ToolCallReply>), ToolCallError> {
     let mut clean = String::new();
     let mut rest = text;
     let mut replies = Vec::new();
-    loop {
-        let Some(start) = rest.find(TOOL_OPEN) else {
-            break;
-        };
+    while let Some(start) = rest.find(TOOL_OPEN) {
         let after_open = start + TOOL_OPEN.len();
-        let Some(rel_end) = rest[after_open..].find(TOOL_CLOSE) else {
+        let payload = &rest[after_open..];
+        let Some(rel_end) = payload.find(TOOL_CLOSE) else {
+            let candidate = payload.trim_start();
+            if candidate.starts_with(['{', '[']) || candidate.starts_with("```") {
+                return Err(ToolCallError::Incomplete);
+            }
             break;
         };
         let end = after_open + rel_end;
         clean.push_str(&rest[..start]);
-        replies.extend(replies_from(parse_envelopes(&rest[after_open..end]), allowed));
+        let body = payload[..rel_end].trim_end();
+        let mut envelopes = parse_envelopes(body);
+        // 标签已闭合时，只补全缺失的外层对象，不补写参数值。
+        if envelopes.is_empty()
+            && body.ends_with('}')
+            && let Ok(value) = serde_json::from_str::<Value>(&format!("{body}}}"))
+            && value["name"].is_string()
+            && value["arguments"].is_object()
+        {
+            envelopes.push(value);
+        }
+        replies.extend(replies_from(envelopes, allowed)?);
         rest = &rest[end + TOOL_CLOSE.len()..];
     }
     if replies.is_empty() {
-        return (text.to_string(), Vec::new());
+        return Ok((text.to_string(), replies));
     }
     clean.push_str(rest);
-    (clean.trim().to_string(), replies)
+    Ok((clean.trim().to_string(), replies))
 }
 
-pub fn extract_bare_tool_call(
-    text: &str,
-    allowed: &HashSet<String>,
-) -> (String, Vec<ToolCallReply>) {
+fn extract_bare_tool_call(text: &str, allowed: &HashSet<String>) -> Option<Vec<ToolCallReply>> {
     if allowed.is_empty() {
-        return (text.to_string(), Vec::new());
+        return None;
     }
     let mut trimmed = text.trim();
     if trimmed.starts_with("```") {
@@ -740,26 +777,22 @@ pub fn extract_bare_tool_call(
         }
     }
     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
-        return (text.to_string(), Vec::new());
+        return None;
     }
-    let replies = replies_from(parse_envelopes(trimmed), allowed);
-    if replies.is_empty() {
-        (text.to_string(), Vec::new())
-    } else {
-        (String::new(), replies)
-    }
+    replies_from(parse_envelopes(trimmed), allowed).ok()
 }
 
 pub fn parse_client_tool_calls(
     text: &str,
     allowed: &HashSet<String>,
-) -> (String, Vec<ToolCallReply>) {
-    let (clean, replies) = extract_tool_calls(text, allowed);
-    if !replies.is_empty() {
-        (clean, replies)
-    } else {
-        extract_bare_tool_call(text, allowed)
+) -> Result<(String, Vec<ToolCallReply>), ToolCallError> {
+    let (clean, replies) = extract_tool_calls(text, allowed)?;
+    if replies.is_empty()
+        && let Some(calls) = extract_bare_tool_call(text, allowed)
+    {
+        return Ok((String::new(), calls));
     }
+    Ok((clean, replies))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -800,7 +833,7 @@ impl BridgeStream {
             if lead.is_empty() {
                 return None;
             }
-            if lead.starts_with('{') || lead.starts_with('[') || lead.starts_with('`') {
+            if !self.allowed.is_empty() && lead.starts_with(['{', '[', '`']) {
                 self.mode = BridgeMode::Held;
                 return None;
             }
@@ -844,32 +877,111 @@ impl BridgeStream {
         Some(text.to_string())
     }
 
-    pub fn finish(&mut self) -> (Option<String>, Vec<ToolCallReply>) {
+    pub fn finish(&mut self) -> Result<(Option<String>, Vec<ToolCallReply>), ToolCallError> {
         let rest = std::mem::take(&mut self.pending);
         let (text, replies) = if self.emitted {
             extract_tool_calls(&rest, &self.allowed)
         } else {
             parse_client_tool_calls(&rest, &self.allowed)
+        }?;
+        let tail = if !text.trim().is_empty() || (self.emitted && replies.is_empty()) {
+            self.emit_chunk(&text)
+        } else {
+            None
         };
-        if !replies.is_empty() {
-            let extra = if !text.trim().is_empty() {
-                self.emitted = true;
-                Some(text)
-            } else {
-                None
-            };
-            return (extra, replies);
-        }
-        if !rest.trim().is_empty() || self.emitted {
-            return (self.emit_chunk(&rest), Vec::new());
-        }
-        (None, Vec::new())
+        Ok((tail, replies))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_prompt_keeps_required_fields_inside_arrays() {
+        let tools = [json!({
+            "function": {"name":"update_plan", "parameters": {
+                "type":"object", "required":["items"], "properties":{
+                    "items":{"type":"array","items":{
+                        "type":"object", "required":["content","status"], "properties":{
+                            "content":{"type":"string"},
+                            "status":{"enum":["pending","in_progress","completed"]}
+                        }
+                    }}
+                }
+            }}
+        })];
+        let prompt =
+            build_tool_bridge_prompt(Some(&tools), None, "auto", "", true, ToolDetail::Desc(0));
+        assert!(prompt.contains("content*: string"));
+        assert!(prompt.contains(r#"status*: "pending"|"in_progress"|"completed""#));
+    }
+
+    #[test]
+    fn bridge_stream_repairs_typographic_json_quotes() {
+        let mut stream = BridgeStream::new([String::from("Bash")].into());
+        assert!(stream.push("<client_tool").is_none());
+        let rest = r#"_call>{“name”:“Bash”,“arguments”:{“command”:“cd \"$TEMP\" && printf '%s' '“示例”'”,“description”:“读取示例”}}</client_tool_call>"#;
+        assert!(stream.push(rest).is_none());
+        let (tail, calls) = stream.finish().unwrap();
+        assert!(tail.is_none());
+        assert_eq!(calls.len(), 1);
+        let arguments: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(
+            arguments["command"],
+            r#"cd "$TEMP" && printf '%s' '“示例”'"#
+        );
+    }
+
+    #[test]
+    fn tagged_tool_call_can_recover_its_outer_closing_brace() {
+        let allowed = [String::from("Bash")].into();
+        let payload = r#"{"name":"Bash","arguments":{"command":"python -c \"\nprint('示例')\n\"","description":"读取示例"}"#;
+        let tagged = format!("{TOOL_OPEN}{payload}{TOOL_CLOSE}");
+        let (text, calls) = parse_client_tool_calls(&tagged, &allowed).unwrap();
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "Bash");
+        let arguments: Value = serde_json::from_str(&calls[0].arguments).unwrap();
+        assert_eq!(arguments["command"], "python -c \"\nprint('示例')\n\"");
+
+        let (_, bare_calls) = parse_client_tool_calls(payload, &allowed).unwrap();
+        assert!(bare_calls.is_empty());
+        let incomplete_payload = payload.strip_suffix('}').unwrap();
+        let incomplete = format!("{TOOL_OPEN}{incomplete_payload}{TOOL_CLOSE}");
+        assert!(matches!(
+            parse_client_tool_calls(&incomplete, &allowed),
+            Err(ToolCallError::Invalid)
+        ));
+        assert!(matches!(
+            parse_client_tool_calls(&tagged, &HashSet::new()),
+            Err(ToolCallError::Unavailable)
+        ));
+    }
+
+    #[test]
+    fn bridge_stream_does_not_publish_unusable_tagged_calls() {
+        let mut stream = BridgeStream::new([String::from("Read")].into());
+        let raw = r#"<client_tool_call>{"name":"Bash","arguments":{"command":"printf demo"}}</client_tool_call>"#;
+        assert!(stream.push(raw).is_none());
+        assert!(matches!(stream.finish(), Err(ToolCallError::Unavailable)));
+    }
+
+    #[test]
+    fn bridge_stream_keeps_prose_but_rejects_an_incomplete_tool_call() {
+        let mut stream = BridgeStream::new(HashSet::new());
+        assert_eq!(
+            stream.push("The marker is <client_tool_call>.").as_deref(),
+            Some("The marker is ")
+        );
+        let (tail, calls) = stream.finish().unwrap();
+        assert_eq!(tail.as_deref(), Some("<client_tool_call>."));
+        assert!(calls.is_empty());
+
+        let mut stream = BridgeStream::new([String::from("Read")].into());
+        assert!(stream.push(r#"<client_tool_call>{"name":"Read""#).is_none());
+        assert!(matches!(stream.finish(), Err(ToolCallError::Incomplete)));
+    }
 
     #[test]
     fn test_bridge_stream_splits_marker() {
@@ -885,7 +997,7 @@ mod tests {
                 out.push_str(&t);
             }
         }
-        let (tail, calls) = s.finish();
+        let (tail, calls) = s.finish().unwrap();
         if let Some(t) = tail {
             out.push_str(&t);
         }
@@ -899,7 +1011,7 @@ mod tests {
         let allowed: HashSet<String> = ["bash"].into_iter().map(String::from).collect();
         let mut s = BridgeStream::new(allowed);
         assert!(s.push("```json\n{\"name\":\"bash\",\"arguments\":{\"cmd\":\"ls\"}}\n```").is_none());
-        let (tail, calls) = s.finish();
+        let (tail, calls) = s.finish().unwrap();
         assert!(tail.is_none());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "bash");
@@ -909,7 +1021,7 @@ mod tests {
     fn test_unescaped_quotes_in_shell_command_case1() {
         let allowed: HashSet<String> = ["Bash"].into_iter().map(String::from).collect();
         let leaked = r#"<client_tool_call>{"name":"Bash","arguments":{"command":"for d in /Users/e7ic/.codex/worktrees/v126-1-trip-fixes /Users/e7ic/.codex/worktrees/v126-back-school-qa; do rm "$d/.codex-worktree-name" && rmdir "$d" && echo "已删除 $d"; done; echo '--- worktree 列表:'; git worktree list; echo '--- chore/261124 与 main 差异:'; git rev-parse chore/261124 main","description":"删除两个只剩空标记文件的 codex 残留目录，并复核结果"}}</client_tool_call>"#;
-        let (clean, calls) = parse_client_tool_calls(leaked, &allowed);
+        let (clean, calls) = parse_client_tool_calls(leaked, &allowed).unwrap();
         assert!(clean.is_empty());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Bash");
@@ -926,7 +1038,7 @@ mod tests {
         let mut stream = BridgeStream::new(allowed);
         assert!(stream.push(&leaked[..40]).is_none());
         assert!(stream.push(&leaked[40..]).is_none());
-        let (tail, calls) = stream.finish();
+        let (tail, calls) = stream.finish().unwrap();
         assert!(tail.is_none());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Bash");
@@ -939,7 +1051,7 @@ mod tests {
     fn test_repair_invalid_escapes_and_raw_newlines() {
         let allowed: HashSet<String> = ["Grep", "Bash"].into_iter().map(String::from).collect();
         let raw = "<client_tool_call>{\"name\":\"Grep\",\"arguments\":{\"pattern\":\"foo\\d+\\s+\",\"note\":\"line1\nline2\",}}</client_tool_call>";
-        let (clean, calls) = parse_client_tool_calls(raw, &allowed);
+        let (clean, calls) = parse_client_tool_calls(raw, &allowed).unwrap();
         assert!(clean.is_empty());
         assert_eq!(calls.len(), 1);
         let parsed: Value = serde_json::from_str(&calls[0].arguments).unwrap();

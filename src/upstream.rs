@@ -34,6 +34,7 @@ const STOP_SETTLE_MS: u64 = 3_000;
 pub enum UpstreamErrorKind {
     Handshake,
     Upstream,
+    InvalidToolCall,
     Quota,
     Cancelled,
     TooLarge,

@@ -8,8 +8,8 @@ use crate::messages::{
 use crate::qbs::{self, SpentAllowance};
 use crate::threads::{ThreadHistory, ThreadMatch, ThreadStore, digest};
 use crate::toolbridge::{
-    BridgeStream, TOOL_DETAILS, TOOL_REMINDER, ToolCallReply, ToolDetail, build_tool_bridge_prompt,
-    parse_client_tool_calls, parse_tool_choice, requested_tool_names,
+    BridgeStream, TOOL_DETAILS, TOOL_REMINDER, ToolCallError, ToolCallReply, ToolDetail,
+    build_tool_bridge_prompt, parse_client_tool_calls, parse_tool_choice, requested_tool_names,
 };
 use crate::upstream::{
     ContextUsage, TurnInput, UpstreamError, UpstreamErrorKind, UpstreamEvent, UpstreamSession,
@@ -241,6 +241,14 @@ pub fn failure_from_error(err: &UpstreamError, spent: Option<&SpentAllowance>) -
             retry_after_secs: None,
             reported_usage,
         },
+        UpstreamErrorKind::InvalidToolCall => ChatFailure {
+            status: 502,
+            code: "invalid_tool_call".to_string(),
+            message: err.message.clone(),
+            sign_in_expired: false,
+            retry_after_secs: None,
+            reported_usage,
+        },
         UpstreamErrorKind::Upstream if throttled.is_match(&err.message) => ChatFailure {
             status: 429,
             code: "rate_limit_exceeded".to_string(),
@@ -318,10 +326,17 @@ pub fn prepare(body: &Value, cfg: &Settings) -> Result<PreparedTurn> {
         bail!("messages must not be empty");
     }
     let prompt = prompt_blocks(&messages, None, None)?.join("\n\n");
-    let mut allowed = requested_tool_names(body);
+    let mut bridge_allowed = requested_tool_names(body);
     let choice = parse_tool_choice(obj.get("tool_choice").or_else(|| obj.get("function_call")));
-    if choice.mode == "function" && !choice.name.is_empty() {
-        allowed.insert(choice.name.clone());
+    match choice.mode.as_str() {
+        "none" => bridge_allowed.clear(),
+        "function" if !choice.name.is_empty() => {
+            if !bridge_allowed.contains(&choice.name) {
+                bail!("the selected tool must be available in the current request");
+            }
+            bridge_allowed.retain(|name| name == &choice.name);
+        }
+        _ => {}
     }
     let parallel = obj
         .get("parallel_tool_calls")
@@ -356,11 +371,6 @@ pub fn prepare(body: &Value, cfg: &Settings) -> Result<PreparedTurn> {
         .get(&ToolDetail::Full)
         .map(|s| s.is_empty())
         .unwrap_or(true);
-    let bridge_allowed = if choice.mode == "function" && !choice.name.is_empty() {
-        [choice.name.clone()].into_iter().collect()
-    } else {
-        allowed
-    };
     let system = system_text(&messages);
     let model = map_model(
         obj.get("model").and_then(|v| v.as_str()).unwrap_or(""),
@@ -749,7 +759,14 @@ pub(crate) async fn run_turn_for_account(
             }
 
             let (text, mut calls) = if turn.bridge {
-                parse_client_tool_calls(&res.text, &turn.bridge_allowed)
+                match parse_client_tool_calls(&res.text, &turn.bridge_allowed) {
+                    Ok(reply) => reply,
+                    Err(reason) => {
+                        let err = invalid_tool_call(reason, res.usage);
+                        finish_failed_thread(&threads, thread, &err).await;
+                        return Err(err);
+                    }
+                }
             } else {
                 (res.text.clone(), Vec::new())
             };
@@ -877,58 +894,48 @@ pub(crate) async fn run_turn_for_account(
                         }
                     }
                 }
-                (bridge, reply, signaled, first_tx)
+                (bridge, reply, first_tx)
             });
 
             let res =
                 chat(&sess_owned, &cfg_owned, &composed.input, cancel_owned.clone(), Some(ev_tx))
                     .await;
 
-            let Ok((mut bridge, mut reply, signaled, mut first_tx)) = bridge_task.await else {
+            let Ok((mut bridge, mut reply, mut first_tx)) = bridge_task.await else {
                 if let Some(t) = &thread {
                     ThreadStore::discard(threads_owned, t.id.clone()).await;
                 }
                 return;
             };
 
-            match res {
-                Ok(up_res) => {
-                    let mut calls = Vec::new();
-                    if let Some(b) = bridge.as_mut() {
-                        let (tail, c) = b.finish();
-                        if let Some(t) = tail {
-                            if !t.is_empty() {
-                                reply.push_str(&t);
-                                if let Some(tx) = first_tx.take() {
-                                    let _ = tx.send(Ok(()));
-                                }
-                                let _ = out_tx.send(TurnEvent::Text(t));
-                            }
-                        }
-                        calls = c;
-                    }
-                    if !parallel && calls.len() > 1 {
-                        calls.truncate(1);
-                    }
-                    if reply.is_empty() && calls.is_empty() {
-                        let err = UpstreamError::new(
+            let result = res.and_then(|up_res| {
+                let parsed = bridge
+                    .as_mut()
+                    .map_or(Ok((None, Vec::new())), BridgeStream::finish);
+                match parsed {
+                    Err(reason) => Err(invalid_tool_call(reason, up_res.usage)),
+                    Ok((None, calls)) if reply.is_empty() && calls.is_empty() => {
+                        Err(UpstreamError::new(
                             UpstreamErrorKind::Upstream,
                             "upstream returned no text or tool calls",
                             502,
                         )
-                        .with_reported_usage(up_res.usage);
-                        finish_failed_thread(&threads_owned, thread, &err).await;
-                        if !signaled {
-                            if let Some(tx) = first_tx.take() {
-                                let _ = tx.send(Err(err));
-                            }
-                        } else {
-                            let _ = out_tx.send(TurnEvent::Error(failure_from_error(&err, None)));
-                        }
-                        return;
+                        .with_reported_usage(up_res.usage))
                     }
+                    Ok((tail, calls)) => Ok((tail, calls, up_res.usage)),
+                }
+            });
+            match result {
+                Ok((tail, mut calls, usage)) => {
                     if let Some(tx) = first_tx.take() {
                         let _ = tx.send(Ok(()));
+                    }
+                    if let Some(text) = tail {
+                        reply.push_str(&text);
+                        let _ = out_tx.send(TurnEvent::Text(text));
+                    }
+                    if !parallel {
+                        calls.truncate(1);
                     }
                     if let Some(history) = &history_owned {
                         ThreadStore::remember(
@@ -945,16 +952,12 @@ pub(crate) async fn run_turn_for_account(
                     for call in calls {
                         let _ = out_tx.send(TurnEvent::Tool(call));
                     }
-                    let _ = out_tx.send(TurnEvent::Done(NormalizedUsage::from_upstream(
-                        &up_res.usage,
-                    )));
+                    let _ = out_tx.send(TurnEvent::Done(NormalizedUsage::from_upstream(&usage)));
                 }
                 Err(e) => {
                     finish_failed_thread(&threads_owned, thread, &e).await;
-                    if !signaled {
-                        if let Some(tx) = first_tx.take() {
-                            let _ = tx.send(Err(e));
-                        }
+                    if let Some(tx) = first_tx.take() {
+                        let _ = tx.send(Err(e));
                     } else {
                         let _ = out_tx.send(TurnEvent::Error(failure_from_error(&e, None)));
                     }
@@ -1015,6 +1018,11 @@ pub(crate) async fn run_turn_for_account(
             Err(failure_from_error(&e, spent.as_ref()))
         }
     }
+}
+
+fn invalid_tool_call(reason: ToolCallError, usage: UpstreamUsage) -> UpstreamError {
+    UpstreamError::new(UpstreamErrorKind::InvalidToolCall, reason.to_string(), 502)
+        .with_reported_usage(usage)
 }
 
 async fn finish_failed_thread(

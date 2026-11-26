@@ -218,6 +218,35 @@ async fn test_gateway_http_routes_and_pool_failover() {
             .contains("model")
     );
 
+    let mut auto_config = pool.config();
+    auto_config.options.insert("default_model".into(), json!("auto"));
+    pool.update_config(auto_config).unwrap();
+    let auto_models: Value = client
+        .get(&desktop_models)
+        .bearer_auth(&cfg.api_key)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(auto_models["first_id"], "claude-auto-bridge");
+    assert_eq!(auto_models["data"][0]["display_name"], "Quick Auto");
+
+    let count = client
+        .post(format!("{desktop_base}/v1/messages/count_tokens"))
+        .bearer_auth(&cfg.api_key)
+        .json(&json!({
+            "model": auto_models["first_id"],
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(count.status(), 200);
+
     let port = srv.addr.port();
     srv.stop_and_wait().await;
     let restarted = start_server(pool, "127.0.0.1", port).await.unwrap();

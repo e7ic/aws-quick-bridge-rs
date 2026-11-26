@@ -44,9 +44,9 @@ Rust 重写的 Amazon Quick（QuickWork）多协议桥接器，内置自主实�
 - **Claude Desktop** 在 macOS 或 Windows 的「客户端接入 → Claude Desktop」选择「一键接入」。Quick Bridge 会创建独立的直连配置并启动网关。Claude Desktop 正在运行时，配置会在它完全退出后写入，随后打开即可使用。可在原卡片选择「恢复原接入」。
 - **通过配置文件接入 Claude Desktop**。在「客户端接入」选择「导出配置」，再从 Claude Desktop 的「Developer → Configure Third-Party Inference」右上角导入 JSON，应用更改并重启。导出文件包含网关密钥，请按密钥保管。[Claude Desktop 导入配置](https://claude.com/docs/third-party/claude-desktop/in-app-configuration#set-up-a-device-without-mdm)
 
-模型列表显示 Quick Smart、Quick Balanced 和 Quick Fast。每次请求实际使用的模型以日志为准。
+模型选择器显示 Quick Smart、Quick Balanced 和 Quick Fast。默认挡位为 Auto 时，也会列出 Quick Auto。每次请求实际使用的模型以日志为准。
 
-在 Desktop 的原生第三方推理设置中手动填写模型列表时，可使用 `smart`、`balanced`、`fast` 作为模型 ID，并为它们填写对应的显示名。[模型列表设置](https://claude.com/docs/third-party/claude-desktop/models#model-list-and-default-model)
+一键接入与导出配置使用 Desktop 模型发现接口提供的路由 ID。已有 Quick Bridge 配置可在客户端卡片上点「更新接入」。[模型列表设置](https://claude.com/docs/third-party/claude-desktop/models#model-list-and-default-model)
 
 ### 使用 CC Switch 导入 Claude Desktop
 

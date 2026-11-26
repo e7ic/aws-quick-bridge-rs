@@ -1,6 +1,6 @@
 [package]
 name = "aws-quick-bridge-rs"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 default-run = "aws-quick-bridge-rs"
 description = "Rust implementation of Amazon Quick (QuickWork) bridge with Magpie-style multi-account pool, Anthropic/OpenAI gateway, CC Switch integration, and GPUI desktop app."

@@ -19,6 +19,7 @@ use tokio_tungstenite::tungstenite::{Message, handshake::server::Request};
 
 const SIGN_IN: &str = "test-gateway-key";
 const LIMIT_NOTICE: &str = "You've reached your usage limit. Check your profile for details.";
+const DESKTOP_COMMAND: &str = r#"cd "$TEMP" && printf '%s' '“示例”'"#;
 
 async fn receive(ws: &mut WebSocketStream<TcpStream>) -> Option<Value> {
     while let Some(msg) = ws.next().await {
@@ -133,6 +134,31 @@ async fn quick_turn(
                     json!({"text":" Check your profile for details."}),
                 )
                 .await;
+            } else if text.starts_with("read Desktop fixture") {
+                for delta in [
+                    "Reading the document. ",
+                    "<client_tool",
+                    r#"_call>{“name”:“Bash”,“arguments”:{“command”:“cd \"$TEMP\" && printf '%s' '“示例”'”}}</client_tool_call>"#,
+                ] {
+                    send(&mut ws, "text_delta", json!({"text":delta})).await;
+                }
+            } else if text.starts_with("blocked Desktop tool") {
+                send(&mut ws, "text_delta", json!({
+                    "text":r#"<client_tool_call>{"name":"private_tool","arguments":{}}</client_tool_call>"#
+                })).await;
+            } else if text.starts_with("invalid Desktop tool") {
+                send(
+                    &mut ws,
+                    "text_delta",
+                    json!({"text":"Checking the document. "}),
+                )
+                .await;
+                send(
+                    &mut ws,
+                    "text_delta",
+                    json!({"text":"<client_tool_call>{invalid}</client_tool_call>"}),
+                )
+                .await;
             } else if text.contains("quote allowance") {
                 send(&mut ws, "text_delta", json!({"text":LIMIT_NOTICE})).await;
                 send(&mut ws, "text_delta", json!({"text":" is an example."})).await;
@@ -199,6 +225,116 @@ async fn wait_for_log(pool: &AccountPool, api: &str, status: u16, count: usize) 
     .unwrap();
 }
 
+async fn check_desktop_tool_bridge(
+    client: &reqwest::Client,
+    gateway: &RunningServer,
+    turns: &mut mpsc::UnboundedReceiver<(String, Value)>,
+) {
+    let tools = json!([
+        {"name":"Bash","defer_loading":true,"input_schema":{
+            "type":"object","required":["command"],"properties":{"command":{"type":"string"}}
+        }},
+        {"name":"private_tool","allowed_callers":["code_execution_20260120"],"input_schema":{"type":"object"}}
+    ]);
+    let request = |prompt: &str, stream: bool, tools: &Value| {
+        client
+            .post(format!(
+                "http://{}/claude-desktop/v1/messages",
+                gateway.addr
+            ))
+            .bearer_auth(SIGN_IN)
+            .json(&json!({
+                "model":"claude-opus-bridge", "stream":stream, "max_tokens":128,
+                "tools":tools, "messages":[{"role":"user","content":prompt}]
+            }))
+    };
+
+    for stream in [false, true] {
+        let response = request("read Desktop fixture", stream, &tools)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!response.contains("<client_tool_call>"));
+        assert!(response.contains("Reading the document."));
+        if stream {
+            let events: Vec<Value> = response
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect();
+            let call = events
+                .iter()
+                .find(|event| event["content_block"]["type"] == "tool_use")
+                .unwrap();
+            assert_eq!(call["content_block"]["name"], "Bash");
+            let args = events
+                .iter()
+                .find_map(|event| event["delta"]["partial_json"].as_str())
+                .unwrap();
+            let args: Value = serde_json::from_str(args).unwrap();
+            assert_eq!(args["command"], DESKTOP_COMMAND);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["delta"]["stop_reason"] == "tool_use")
+            );
+        } else {
+            let response: Value = serde_json::from_str(&response).unwrap();
+            let call = &response["content"][1];
+            assert_eq!(call["type"], "tool_use");
+            assert_eq!(call["name"], "Bash");
+            assert_eq!(call["input"]["command"], DESKTOP_COMMAND);
+            assert_eq!(response["stop_reason"], "tool_use");
+        }
+        let (_, sent) = turns.recv().await.unwrap();
+        assert!(
+            !sent["custom_prompt"]
+                .as_str()
+                .unwrap()
+                .contains("private_tool")
+        );
+    }
+
+    let blocked = request("blocked Desktop tool", false, &tools)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), 502);
+    let error: Value = blocked.json().await.unwrap();
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("current tool list")
+    );
+    turns.recv().await.unwrap();
+    assert!(
+        turns.is_empty(),
+        "invalid tool output must not try another account"
+    );
+
+    let invalid = request("invalid Desktop tool", true, &json!([]))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    turns.recv().await.unwrap();
+    assert!(invalid.contains("Checking the document."));
+    assert!(invalid.contains("event: error"));
+    assert!(invalid.contains("invalid tool call data"));
+    assert!(!invalid.contains("<client_tool_call>"));
+    assert!(!invalid.contains("event: message_stop"));
+}
+
 #[tokio::test]
 async fn resumes_after_restart_fails_over_on_quota_and_stops_on_disconnect() {
     let dir = tempfile::tempdir().unwrap();
@@ -241,6 +377,7 @@ async fn resumes_after_restart_fails_over_on_quota_and_stops_on_disconnect() {
         .build()
         .unwrap();
     let first = gateway(AccountPool::load().unwrap()).await;
+    check_desktop_tool_bridge(&client, &first, &mut turns).await;
     request(
         &client,
         &first,

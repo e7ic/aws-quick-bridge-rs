@@ -470,7 +470,11 @@ async fn execute_request(
     chat_body["model"] = json!(mapped_model);
 
     let turn = match prepare(&chat_body, &cfg) {
-        Ok(turn) => Arc::new(turn),
+        Ok(mut turn) => {
+            // Desktop 的后续回合也可能收到没有可调用工具的标记。
+            turn.bridge |= desktop;
+            Arc::new(turn)
+        }
         Err(e) => return api.error(400, &e.to_string(), "invalid_request_error", None),
     };
     let history = cfg.stateful.then(|| {
@@ -641,7 +645,8 @@ async fn execute_request(
                     },
                 );
 
-                let should_failover = matches!(f.status, 401 | 403 | 429 | 502 | 504);
+                let should_failover = f.code != "invalid_tool_call"
+                    && matches!(f.status, 401 | 403 | 429 | 502 | 504);
                 last_failure = Some(f);
                 if !should_failover {
                     break;
@@ -710,7 +715,9 @@ async fn dispatch(
     }
 
     match (method.clone(), path.as_str()) {
-        (Method::GET, "/models") if desktop => models_response(claude_desktop::list_models()),
+        (Method::GET, "/models") if desktop => {
+            models_response(claude_desktop::list_models(pool.settings().default_model == "auto"))
+        }
         (Method::GET, "/models") => handle_models(&pool).await,
         (Method::POST, "/chat/completions") if !desktop => {
             execute_with_pool(pool, ApiKind::Chat, headers, body, false).await
