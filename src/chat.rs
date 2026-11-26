@@ -450,6 +450,56 @@ fn longest_fit<F: FnMut(&str) -> bool>(text: &str, mut fits: F) -> String {
     middle_cut(text, low)
 }
 
+fn fit_system_prompt(
+    turn: &PreparedTurn,
+    input: &mut TurnInput,
+    limit: usize,
+    measure: &impl Fn(&TurnInput) -> usize,
+) {
+    if limit == 0 || input.system_prompt.is_empty() || measure(input) <= limit {
+        return;
+    }
+
+    input.system_prompt.clear();
+    let prompt = std::mem::take(&mut input.prompt);
+    let fixed_bytes = measure(input);
+    // 先扣除附件引用和固定字段，再给长对话留一半可用空间。
+    let split = fixed_bytes + limit.saturating_sub(fixed_bytes) / 2;
+    input.prompt = prompt;
+    let prompt_frame = measure(input);
+    let (deferred_prompt, room, bare) = if prompt_frame <= split {
+        (None, limit, prompt_frame)
+    } else {
+        (Some(std::mem::take(&mut input.prompt)), split, fixed_bytes)
+    };
+
+    let mut chosen_detail = *TOOL_DETAILS.last().unwrap();
+    for &detail in TOOL_DETAILS {
+        input.system_prompt = turn.custom_prompt(&turn.system, detail);
+        if measure(input) <= room {
+            chosen_detail = detail;
+            break;
+        }
+        input.system_prompt = turn.custom_prompt("", detail);
+        if measure(input).saturating_sub(bare) <= room.saturating_sub(bare) / 2 {
+            chosen_detail = detail;
+            break;
+        }
+    }
+
+    input.system_prompt = turn.custom_prompt(&turn.system, chosen_detail);
+    if measure(input) > room {
+        let cut = longest_fit(&turn.system, |cut| {
+            input.system_prompt = turn.custom_prompt(cut, chosen_detail);
+            measure(input) <= room
+        });
+        input.system_prompt = turn.custom_prompt(&cut, chosen_detail);
+    }
+    if let Some(prompt) = deferred_prompt {
+        input.prompt = prompt;
+    }
+}
+
 pub struct ComposedTurn {
     pub input: TurnInput,
     pub custom_digest: String,
@@ -482,6 +532,17 @@ async fn compose(
     input.resume = thread.is_some();
     input.prompt = blocks.join("\n\n");
 
+    for img in images.into_iter().take(10) {
+        if let Ok(bytes) = B64.decode(img.base64.trim()) {
+            if let Ok(att) =
+                qbs::upload_attachment(auth, cfg, &img.name, &img.mime_type, &bytes, thread_id)
+                    .await
+            {
+                input.attachments.push(att);
+            }
+        }
+    }
+
     let limit = cfg.max_frame_bytes;
     let measure = |inp: &TurnInput| frame_bytes(&user_message(session, cfg, inp));
     let fits_fn = |inp: &TurnInput| limit == 0 || measure(inp) <= limit;
@@ -494,42 +555,8 @@ async fn compose(
     }
     let instructed = !input.system_prompt.is_empty();
 
-    if !fits_fn(&input) && instructed {
-        let saved_prompt = input.prompt.clone();
-        input.system_prompt.clear();
-        let short = measure(&input) <= limit / 2;
-        if !short {
-            input.prompt.clear();
-        }
-        let bare = measure(&input);
-        let room = if short { limit } else { limit / 2 };
+    fit_system_prompt(turn, &mut input, limit, &measure);
 
-        let mut chosen_detail = *TOOL_DETAILS.last().unwrap();
-        for &d in TOOL_DETAILS {
-            input.system_prompt = turn.custom_prompt(&turn.system, d);
-            if measure(&input) <= room {
-                chosen_detail = d;
-                break;
-            }
-            input.system_prompt = turn.custom_prompt("", d);
-            if measure(&input).saturating_sub(bare) <= room.saturating_sub(bare) / 2 {
-                chosen_detail = d;
-                break;
-            }
-        }
-
-        input.system_prompt = turn.custom_prompt(&turn.system, chosen_detail);
-        if measure(&input) > room {
-            let cut_sys = longest_fit(&turn.system, |cut| {
-                input.system_prompt = turn.custom_prompt(cut, chosen_detail);
-                measure(&input) <= room
-            });
-            input.system_prompt = turn.custom_prompt(&cut_sys, chosen_detail);
-        }
-        input.prompt = saved_prompt;
-    }
-
-    let mut attachments = Vec::new();
     if !fits_fn(&input) && cfg.attachments {
         let last = if blocks.len() > 1 && blocks.last().map(|s| s.len()).unwrap_or(0) <= 6000 {
             blocks.last().cloned().unwrap_or_default()
@@ -546,7 +573,7 @@ async fn compose(
         if let Ok(att) =
             qbs::upload_attachment(auth, cfg, &name, "text/plain", bytes, thread_id).await
         {
-            attachments.push(att);
+            input.attachments.insert(0, att);
             let head = if !last.is_empty() {
                 "The conversation up to the last message"
             } else {
@@ -563,6 +590,7 @@ async fn compose(
                 bytes.len()
             );
             blocks = vec![input.prompt.clone()];
+            fit_system_prompt(turn, &mut input, limit, &measure);
         }
     }
 
@@ -589,21 +617,6 @@ async fn compose(
             });
             input.prompt = cut;
         }
-    }
-
-    for img in images.into_iter().take(10) {
-        if let Ok(bytes) = B64.decode(img.base64.trim()) {
-            if let Ok(att) =
-                qbs::upload_attachment(auth, cfg, &img.name, &img.mime_type, &bytes, thread_id)
-                    .await
-            {
-                attachments.push(att);
-            }
-        }
-    }
-
-    if !attachments.is_empty() {
-        input.attachments = attachments;
     }
 
     if !fits_fn(&input) {
@@ -1023,3 +1036,6 @@ async fn finish_failed_thread(
         ThreadStore::discard(threads.clone(), thread.id).await;
     }
 }
+
+#[cfg(test)]
+mod tests;

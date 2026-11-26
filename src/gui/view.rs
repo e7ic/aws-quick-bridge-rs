@@ -80,6 +80,30 @@ impl BridgeApp {
             .child(title)
     }
 
+    fn theme_toggle_icon(darkness: f32, color: Hsla) -> Div {
+        const ICON_SIZE: f32 = 14.0;
+        const TURN: f32 = 0.55;
+        let lightness = 1.0 - darkness;
+        div()
+            .relative()
+            .size(px(ICON_SIZE))
+            .flex_shrink_0()
+            .children(
+                [
+                    ("icons/moon-bold.svg", lightness, -darkness * TURN),
+                    ("icons/sun-2-bold.svg", darkness, lightness * TURN),
+                ]
+                .into_iter()
+                .filter(|(_, opacity, _)| *opacity > 0.0)
+                .map(|(path, opacity, angle)| {
+                    Self::raw_icon(path, ICON_SIZE, color.opacity(opacity))
+                        .absolute()
+                        .inset_0()
+                        .with_transformation(Transformation::rotate(radians(angle)))
+                }),
+            )
+    }
+
     fn button_feedback_label(label: &'static str, feedback: &'static str, active: bool) -> Div {
         let longer = if label.chars().count() > feedback.chars().count() {
             label
@@ -3282,17 +3306,29 @@ impl Render for BridgeApp {
                         div()
                             .flex()
                             .items_center()
-                            .justify_between()
                             .h(px(HEADER_HEIGHT))
                             .flex_shrink_0()
                             .px(px(3.0))
                             .child(
                                 div()
+                                    .id("window-titlebar")
+                                    .flex_1()
+                                    .h_full()
                                     .flex()
                                     .items_center()
                                     .gap(px(8.0))
                                     .text_size(px(12.0))
                                     .text_color(t.text_muted)
+                                    .when(cfg!(target_os = "macos"), |header| {
+                                        header.on_click(|event, window, _| {
+                                            if event.click_count() == 2 && !window.is_fullscreen() {
+                                                window.titlebar_double_click();
+                                            }
+                                        })
+                                    })
+                                    .when(cfg!(target_os = "windows"), |header| {
+                                        header.window_control_area(gpui::WindowControlArea::Drag)
+                                    })
                                     .child(Self::icon(
                                         self.active_tab.icon_path(),
                                         14.0,
@@ -3315,32 +3351,14 @@ impl Render for BridgeApp {
                                     true,
                                     BtnVariant::Secondary,
                                     move |color| {
-                                        let icon_path = if dark_mode {
-                                            "icons/sun-2-bold.svg"
-                                        } else {
-                                            "icons/moon-bold.svg"
-                                        };
                                         let label = if dark_mode {
                                             "切换浅色"
                                         } else {
                                             "切换深色"
                                         };
-                                        let target = if dark_mode { 1.0 } else { 0.0 };
                                         [
-                                            motion::spring_value(
-                                                "theme-icon-rot",
-                                                target,
-                                                SpringConfig::SNAPPY,
-                                                move |p| {
-                                                    Self::raw_icon(icon_path, 14.0, color)
-                                                        .with_transformation(
-                                                            Transformation::rotate(radians(
-                                                                (p - target) * -0.55,
-                                                            )),
-                                                        )
-                                                },
-                                            )
-                                            .into_any_element(),
+                                            Self::theme_toggle_icon(darkness, color)
+                                                .into_any_element(),
                                             label.into_any_element(),
                                         ]
                                     },
