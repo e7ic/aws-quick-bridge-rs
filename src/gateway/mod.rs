@@ -10,11 +10,15 @@ use crate::chat::{
     ChatFailure, ChatOutput, NormalizedUsage, TurnEvent, prepare, run_turn_for_account,
 };
 use crate::config::{
-    AccountRecord, account_models, model_display_name, quick_model, resolve_quick_model,
+    AccountRecord, account_models, advanced_supported, model_display_name, quick_model,
+    resolve_quick_model,
 };
-use crate::pool::{AccountPool, LogLevel, RequestLogEntry};
+use crate::pool::{
+    AccountPool, BUSY_SLOT_WAIT, LogLevel, NoAvailableAccount, PREFERRED_SLOT_WAIT, RequestLogEntry,
+};
 use crate::qbs;
 use crate::threads::{ThreadHistory, conversation_of};
+use crate::upstream::wait_for_cancellation;
 use anyhow::Result;
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -27,14 +31,16 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-const SIGN_IN_MSG: &str = "Amazon Quick is not signed in; sign in via GUI or run: aws-quick-bridge-rs login";
+const MAX_ACCOUNT_ATTEMPTS: usize = 32;
+const SIGN_IN_MSG: &str =
+    "Amazon Quick is not signed in; sign in via GUI or run: aws-quick-bridge-rs login";
 
 fn same_key(given: &str, expected: &str) -> bool {
     !given.is_empty()
@@ -43,12 +49,15 @@ fn same_key(given: &str, expected: &str) -> bool {
 }
 
 fn extract_key(headers: &HeaderMap) -> String {
-    if let Some(k) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        if !k.trim().is_empty() {
-            return k.trim().to_string();
-        }
+    if let Some(k) = headers.get("x-api-key").and_then(|v| v.to_str().ok())
+        && !k.trim().is_empty()
+    {
+        return k.trim().to_string();
     }
-    if let Some(auth) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+    if let Some(auth) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
         let trimmed = auth.trim();
         if let Some(rest) = trimmed
             .strip_prefix("Bearer ")
@@ -82,10 +91,10 @@ fn openai_error(status: u16, message: &str, code: &str, retry_after: Option<u64>
         })),
     )
         .into_response();
-    if let Some(secs) = retry_after {
-        if let Ok(hv) = header::HeaderValue::from_str(&secs.to_string()) {
-            resp.headers_mut().insert(header::RETRY_AFTER, hv);
-        }
+    if let Some(secs) = retry_after
+        && let Ok(hv) = header::HeaderValue::from_str(&secs.to_string())
+    {
+        resp.headers_mut().insert(header::RETRY_AFTER, hv);
     }
     resp
 }
@@ -114,10 +123,10 @@ impl ApiKind {
             ApiKind::Responses => responses::error_response(status, message, code),
             ApiKind::Chat => openai_error(status, message, code, retry_after),
         };
-        if let Some(secs) = retry_after {
-            if let Ok(hv) = header::HeaderValue::from_str(&secs.to_string()) {
-                resp.headers_mut().insert(header::RETRY_AFTER, hv);
-            }
+        if let Some(secs) = retry_after
+            && let Ok(hv) = header::HeaderValue::from_str(&secs.to_string())
+        {
+            resp.headers_mut().insert(header::RETRY_AFTER, hv);
         }
         resp
     }
@@ -171,7 +180,10 @@ fn openai_from_chat(
             let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
             tokio::spawn(async move {
                 let send_json = |val: &Value| {
-                    let s = format!("data: {}\n\n", serde_json::to_string(val).unwrap_or_default());
+                    let s = format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(val).unwrap_or_default()
+                    );
                     let _ = tx.send(Ok(Bytes::from(s)));
                 };
                 send_json(&json!({
@@ -276,12 +288,11 @@ fn openai_from_chat(
 async fn handle_models(pool: &Arc<AccountPool>) -> Response {
     let cfg = pool.settings();
     let mut listed = account_models(None);
-    if let Some(acc) = pool.pick_account("", &HashSet::new()) {
-        if let Ok(fresh) = pool.ensure_fresh(&acc.key(), false).await {
-            if let Ok(settings_val) = qbs::account_settings(&fresh, &cfg).await {
-                listed = account_models(settings_val.as_ref());
-            }
-        }
+    if let Some(acc) = pool.pick_account("", &HashSet::new())
+        && let Ok(fresh) = pool.ensure_fresh(&acc.key(), false).await
+        && let Ok(settings_val) = qbs::account_settings(&fresh, &cfg).await
+    {
+        listed = account_models(settings_val.as_ref());
     }
     let created = Utc::now().timestamp();
     let created_iso = Utc::now().to_rfc3339();
@@ -339,7 +350,7 @@ impl RequestCancellation {
 fn account_failed(pool: &Arc<AccountPool>, auth: &AccountRecord, failure: &ChatFailure) {
     let key = auth.key();
     if failure.status == 401 && failure.sign_in_expired {
-        pool.mark_expired(&key, &failure.message);
+        pool.mark_credentials_expired(auth, &failure.message);
     } else if failure.status == 429 {
         let marked = pool.mark_cooldown(&key, failure.retry_after_secs, &failure.message);
         if let Some(until) = marked.filter(|_| failure.confirmed_quota()) {
@@ -396,7 +407,14 @@ async fn execute_request(
     let started_at = Instant::now();
     let body: Value = match serde_json::from_slice::<Value>(&raw_body) {
         Ok(v) if v.is_object() => v,
-        _ => return api.error(400, "the request body is not a JSON object", "invalid_request_error", None),
+        _ => {
+            return api.error(
+                400,
+                "the request body is not a JSON object",
+                "invalid_request_error",
+                None,
+            );
+        }
     };
 
     let desktop_mode = if desktop {
@@ -485,39 +503,51 @@ async fn execute_request(
             &turn.convo,
         ))
     });
-    let preferred_account = history.as_ref().and_then(|history| {
-        pool.threads
-            .lock()
-            .preferred_account(history)
-            .map(str::to_owned)
-    });
-    let run_attempt = |auth| {
-        run_turn_for_account(
-            turn.clone(),
-            auth,
-            cfg.clone(),
-            history.clone(),
-            pool.threads.clone(),
-            cancel_rx.clone(),
-        )
+    let advanced = turn.model == "advanced";
+    let fallback_history = history
+        .as_ref()
+        .filter(|_| advanced)
+        .map(|history| Arc::new(history.with_routed_mode("smart")));
+    let preferred_account = {
+        let threads = pool.threads.lock();
+        history
+            .iter()
+            .chain(fallback_history.iter())
+            .find_map(|history| threads.preferred_account(history).map(str::to_owned))
     };
 
     let mut tried: HashSet<String> = HashSet::new();
     let mut last_failure: Option<ChatFailure> = None;
-
-    for _attempt in 0..8 {
-        if *cancel_rx.borrow() {
-            return api.error(
-                499,
-                "The client cancelled the request",
-                "request_cancelled",
-                None,
-            );
-        }
-        let Some(picked) =
-            pool.pick_account_for_turn(&conversation, &tried, preferred_account.as_deref())
-        else {
+    let mut reservation_cancel = cancel_rx.clone();
+    let retry_window = Duration::from_millis(cfg.request_timeout_ms);
+    let reservation_started = tokio::time::Instant::now();
+    let preferred_deadline = reservation_started + PREFERRED_SLOT_WAIT.min(retry_window);
+    let busy_deadline = reservation_started + BUSY_SLOT_WAIT.min(retry_window);
+    let attempts = pool.enabled_account_count().min(MAX_ACCOUNT_ATTEMPTS);
+    for attempt in 0..attempts {
+        if attempt > 0 && started_at.elapsed() >= retry_window {
             break;
+        }
+        let reservation = tokio::select! {
+            biased;
+            _ = wait_for_cancellation(&mut reservation_cancel) => {
+                return api.error(499, "The client cancelled the request", "request_cancelled", None);
+            }
+            result = pool.reserve_conversation(
+                &conversation, &tried, preferred_account.as_deref(), preferred_deadline, busy_deadline,
+            ) => result,
+        };
+        let (picked, mut active_request) = match reservation {
+            Ok(reservation) => reservation,
+            Err(NoAvailableAccount::Unavailable) => break,
+            Err(NoAvailableAccount::Busy) => {
+                return api.error(
+                    429,
+                    "Amazon Quick accounts are busy. Try again shortly.",
+                    "rate_limit_exceeded",
+                    Some(1),
+                );
+            }
         };
         let acc_key = picked.key();
         let acc_label = picked.display_label();
@@ -542,37 +572,88 @@ async fn execute_request(
             }
         };
 
-        let active_request = pool.track_request(&acc_key);
-        let mut res = run_attempt(auth.clone()).await;
-
-        // 若返回 401 且判定令牌过期，先对当前账号强制刷新重试一次，失败后再切换其他账号。
-        if res
-            .as_ref()
-            .is_err_and(|f| f.status == 401 && f.sign_in_expired)
-            && !*cancel_rx.borrow()
-            && let Ok(renewed) = pool.ensure_fresh(&acc_key, true).await
-        {
-            auth = renewed;
-            res = run_attempt(auth.clone()).await;
+        let mut mode = turn.model.as_str();
+        let mut attempt_history = &history;
+        if advanced {
+            let mut cancelled = cancel_rx.clone();
+            let supported = tokio::select! {
+                biased;
+                _ = wait_for_cancellation(&mut cancelled) => {
+                    return api.error(499, "The client cancelled the request", "request_cancelled", None);
+                }
+                settings = qbs::account_settings(&auth, &cfg) => {
+                    settings.ok().flatten().as_ref().and_then(advanced_supported)
+                }
+            };
+            if supported == Some(false) {
+                mode = "smart";
+                attempt_history = &fallback_history;
+            }
         }
+        let run_attempt = async |mode: &str,
+                                 attempt_history: &Option<Arc<ThreadHistory>>,
+                                 auth: &AccountRecord| {
+            run_turn_for_account(
+                turn.clone(),
+                mode,
+                auth.clone(),
+                cfg.clone(),
+                attempt_history.clone(),
+                pool.threads.clone(),
+                cancel_rx.clone(),
+            )
+            .await
+        };
+
+        active_request.start();
+        let mut refreshed = false;
+        let res = loop {
+            let result = run_attempt(mode, attempt_history, &auth).await;
+            let Err(failure) = &result else { break result };
+            if *cancel_rx.borrow() {
+                break result;
+            }
+            if mode == "advanced" && failure.code == "advanced_unavailable" {
+                qbs::remember_advanced_unavailable(&auth);
+                mode = "smart";
+                attempt_history = &fallback_history;
+                continue;
+            }
+            // 已失效的访问令牌在同一个账号上最多强制续期一次。
+            if failure.status == 401
+                && failure.sign_in_expired
+                && !refreshed
+                && let Ok(renewed) = pool.ensure_fresh(&acc_key, true).await
+            {
+                auth = renewed;
+                refreshed = true;
+                continue;
+            }
+            break result;
+        };
 
         match res {
             Ok(output) => {
-                pool.bind_session(&conversation, &acc_key);
                 let pool_done = pool.clone();
                 let acc_label_done = acc_label.clone();
                 let req_model_done = mapped_model.clone();
+                let route = if mode == turn.model {
+                    mapped_model.clone()
+                } else {
+                    format!("{mapped_model} -> {mode}")
+                };
                 let api_label = api.label().to_string();
 
                 let on_done = move |outcome: Result<NormalizedUsage, ChatFailure>| {
                     let latency = started_at.elapsed().as_millis() as u64;
                     let (status, level, usage, message) = match outcome {
                         Ok(usage) => {
+                            pool_done.bind_session(&conversation, &acc_key);
                             let msg = if usage.resolved_model_id.is_empty() {
-                                format!("{api_label} {req_model_done} ok ({latency}ms)")
+                                format!("{api_label} {route} ok ({latency}ms)")
                             } else {
                                 format!(
-                                    "{api_label} {req_model_done} -> {} ({latency}ms)",
+                                    "{api_label} {route} -> {} ({latency}ms)",
                                     usage.resolved_model_id
                                 )
                             };
@@ -584,7 +665,10 @@ async fn execute_request(
                             (
                                 failure.status,
                                 failure_level(failure.status),
-                                failure.reported_usage.unwrap_or_default(),
+                                failure
+                                    .reported_usage
+                                    .map(|usage| *usage)
+                                    .unwrap_or_default(),
                                 msg,
                             )
                         }
@@ -612,9 +696,11 @@ async fn execute_request(
                 };
 
                 return match api {
-                    ApiKind::Messages => {
-                        anthropic::from_chat_output(output, anthropic_req.as_ref().unwrap(), on_done)
-                    }
+                    ApiKind::Messages => anthropic::from_chat_output(
+                        output,
+                        anthropic_req.as_ref().unwrap(),
+                        on_done,
+                    ),
                     ApiKind::Responses => {
                         responses::from_chat_output(output, responses_req.unwrap(), on_done)
                     }
@@ -622,10 +708,14 @@ async fn execute_request(
                 };
             }
             Err(mut f) => {
-                drop(active_request);
                 let latency = started_at.elapsed().as_millis() as u64;
                 account_failed(&pool, &auth, &f);
-                let usage = f.reported_usage.take().unwrap_or_default();
+                drop(active_request);
+                let usage = f
+                    .reported_usage
+                    .take()
+                    .map(|usage| *usage)
+                    .unwrap_or_default();
                 pool.push_gateway_log(
                     &acc_key,
                     RequestLogEntry {
@@ -645,8 +735,13 @@ async fn execute_request(
                     },
                 );
 
-                let should_failover = f.code != "invalid_tool_call"
-                    && matches!(f.status, 401 | 403 | 429 | 502 | 504);
+                // A submitted timeout is settled before replying. Let the client
+                // replay it, using the original thread when the stop was confirmed.
+                let should_failover = !matches!(
+                    f.code.as_str(),
+                    "invalid_tool_call" | "upstream_chunk_limit"
+                ) && (matches!(f.status, 401 | 403 | 429 | 502)
+                    || f.code == "upstream_connect_timeout");
                 last_failure = Some(f);
                 if !should_failover {
                     break;
@@ -715,9 +810,9 @@ async fn dispatch(
     }
 
     match (method.clone(), path.as_str()) {
-        (Method::GET, "/models") if desktop => {
-            models_response(claude_desktop::list_models(pool.settings().default_model == "auto"))
-        }
+        (Method::GET, "/models") if desktop => models_response(claude_desktop::list_models(
+            pool.settings().default_model == "auto",
+        )),
         (Method::GET, "/models") => handle_models(&pool).await,
         (Method::POST, "/chat/completions") if !desktop => {
             execute_with_pool(pool, ApiKind::Chat, headers, body, false).await
@@ -772,11 +867,7 @@ impl Drop for RunningServer {
     }
 }
 
-pub async fn start_server(
-    pool: Arc<AccountPool>,
-    host: &str,
-    port: u16,
-) -> Result<RunningServer> {
+pub async fn start_server(pool: Arc<AccountPool>, host: &str, port: u16) -> Result<RunningServer> {
     let listener = TcpListener::bind((host, port)).await?;
     let addr = listener.local_addr()?;
     let (tx, rx) = oneshot::channel::<()>();

@@ -219,7 +219,9 @@ async fn test_gateway_http_routes_and_pool_failover() {
     );
 
     let mut auto_config = pool.config();
-    auto_config.options.insert("default_model".into(), json!("auto"));
+    auto_config
+        .options
+        .insert("default_model".into(), json!("auto"));
     pool.update_config(auto_config).unwrap();
     let auto_models: Value = client
         .get(&desktop_models)

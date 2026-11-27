@@ -19,6 +19,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        if: runner.os == 'macOS'
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Run unit and gateway tests
-        run: cargo test --locked
+        run: cargo test --locked --all-targets
+
+  linux-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run CLI and gateway tests
+        run: cargo test --locked --no-default-features --all-targets

@@ -68,8 +68,9 @@ pub fn content_text(content: Option<&Value>, mut images: Option<&mut Vec<InlineI
         Value::String(s) => s.clone(),
         Value::Array(parts) => {
             static DATA_RE: OnceLock<Regex> = OnceLock::new();
-            let data_re = DATA_RE
-                .get_or_init(|| Regex::new(r"(?is)^data:(image/[a-z0-9.+-]+);base64,(.+)$").unwrap());
+            let data_re = DATA_RE.get_or_init(|| {
+                Regex::new(r"(?is)^data:(image/[a-z0-9.+-]+);base64,(.+)$").unwrap()
+            });
 
             let mut out = String::new();
             for part in parts {
@@ -93,7 +94,8 @@ pub fn content_text(content: Option<&Value>, mut images: Option<&mut Vec<InlineI
                         let url = image_part_url(part);
                         if let Some(caps) = data_re.captures(&url) {
                             let mime = caps[1].to_ascii_lowercase();
-                            if let (Some(ext), Some(imgs)) = (image_ext(&mime), images.as_deref_mut())
+                            if let (Some(ext), Some(imgs)) =
+                                (image_ext(&mime), images.as_deref_mut())
                             {
                                 let name = format!("image_{}.{ext}", imgs.len() + 1);
                                 imgs.push(InlineImage {
@@ -135,11 +137,7 @@ pub fn role_of(m: &Value) -> String {
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    if r.is_empty() {
-        "user".to_string()
-    } else {
-        r
-    }
+    if r.is_empty() { "user".to_string() } else { r }
 }
 
 pub fn is_system_role(role: &str) -> bool {
@@ -178,10 +176,10 @@ pub fn prompt_blocks(
                     tc.get("function")
                         .and_then(|f| f.get("name"))
                         .and_then(|v| v.as_str()),
-                ) {
-                    if !id.is_empty() && !name.is_empty() {
-                        tool_names.insert(id.to_string(), name.to_string());
-                    }
+                ) && !id.is_empty()
+                    && !name.is_empty()
+                {
+                    tool_names.insert(id.to_string(), name.to_string());
                 }
             }
         }
@@ -200,7 +198,11 @@ pub fn prompt_blocks(
         let allow_img = role == "user" || role == "tool";
         let content = content_text(
             m.get("content"),
-            if allow_img { images.as_deref_mut() } else { None },
+            if allow_img {
+                images.as_deref_mut()
+            } else {
+                None
+            },
         );
         let has_content = !content.trim().is_empty();
         only_user_text = if role == "user" {
@@ -229,7 +231,8 @@ pub fn prompt_blocks(
                             .map(|s| s.trim())
                             .filter(|s| !s.is_empty())
                             .unwrap_or("unknown");
-                        let args = argument_string(tc.get("function").and_then(|f| f.get("arguments")));
+                        let args =
+                            argument_string(tc.get("function").and_then(|f| f.get("arguments")));
                         blocks.push(format!(
                             "Assistant tool call (id={id}, name={name}): {}",
                             args.trim()
@@ -281,7 +284,11 @@ pub fn prompt_blocks(
                 } else {
                     format!(" ({})", meta.join(", "))
                 };
-                let body = if has_content { content.as_str() } else { "(empty)" };
+                let body = if has_content {
+                    content.as_str()
+                } else {
+                    "(empty)"
+                };
                 blocks.push(format!("Tool result{meta_str}: {body}"));
             }
             "function" => {
@@ -291,7 +298,11 @@ pub fn prompt_blocks(
                 } else {
                     format!(" (name={name})")
                 };
-                let body = if has_content { content.as_str() } else { "(empty)" };
+                let body = if has_content {
+                    content.as_str()
+                } else {
+                    "(empty)"
+                };
                 blocks.push(format!("Function result{meta}: {body}"));
             }
             "user" => {
@@ -310,10 +321,10 @@ pub fn prompt_blocks(
     if blocks.is_empty() {
         bail!("messages contain no text or tool calls");
     }
-    if turns == 1 {
-        if let Some(u) = only_user_text {
-            return Ok(vec![u]);
-        }
+    if turns == 1
+        && let Some(u) = only_user_text
+    {
+        return Ok(vec![u]);
     }
     Ok(blocks)
 }

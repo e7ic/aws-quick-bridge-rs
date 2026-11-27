@@ -2,6 +2,8 @@
 //! 支持 HTTP CONNECT 代理隧道、25 秒应用层+WS 双心跳、中断时发送 `stop_generation`、
 //! `_chunked_frame` 分片重组以及 `resolved_model_id` 采集。
 
+mod chunks;
+
 use crate::config::{AccountRecord, Settings};
 use crate::messages::{argument_string, call_id, title_for, uuid_v4};
 use crate::oauth::is_device_id;
@@ -10,6 +12,7 @@ use crate::wire::{aidp_decode, encode_frame};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use chrono::Utc;
+use chunks::ChunkBuffer;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
@@ -19,6 +22,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -35,9 +39,14 @@ pub enum UpstreamErrorKind {
     Handshake,
     Upstream,
     InvalidToolCall,
+    ChunkLimit,
+    Attachment,
     Quota,
     Cancelled,
     TooLarge,
+    ThreadRejected,
+    AdvancedUnavailable,
+    AdvancedEntitlementUnconfirmed,
     Blocked,
     Timeout,
     Transport,
@@ -50,6 +59,7 @@ pub struct UpstreamError {
     pub message: String,
     pub status: u16,
     pub(crate) reported_usage: Option<Box<UpstreamUsage>>,
+    pub(crate) can_resume_thread: bool,
 }
 
 impl UpstreamError {
@@ -59,6 +69,17 @@ impl UpstreamError {
             message: message.into(),
             status,
             reported_usage: None,
+            // These failures normally precede acceptance or already end the turn.
+            // A cancellation after user_message needs a positive stop outcome below.
+            can_resume_thread: matches!(
+                kind,
+                UpstreamErrorKind::Handshake
+                    | UpstreamErrorKind::Cancelled
+                    | UpstreamErrorKind::Quota
+                    | UpstreamErrorKind::TooLarge
+                    | UpstreamErrorKind::AdvancedUnavailable
+                    | UpstreamErrorKind::Blocked
+            ),
         }
     }
 
@@ -227,7 +248,8 @@ mod context_tests {
         let first = record(json!({
             "total_tokens": 120, "output_tokens": 20,
             "context_window": 320_000, "resolved_model_id": "first"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(first.used_tokens, Some(100));
         assert_eq!(first.window_tokens.map(NonZeroU64::get), Some(320_000));
         assert_eq!(record(json!({"output_tokens": 7})), Some(first));
@@ -235,7 +257,8 @@ mod context_tests {
         let second = record(json!({
             "input_tokens": 90, "cache_read_tokens": 0, "cache_write_tokens": 10,
             "context_window": 0, "served_model_id": "second"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(second.used_tokens, Some(100));
         assert_eq!(second.window_tokens, None);
     }
@@ -302,7 +325,7 @@ pub fn user_message(session: &UpstreamSession, cfg: &Settings, input: &TurnInput
     payload.insert("panel_edits".into(), json!([]));
     payload.insert("custom_prompt".into(), custom_prompt);
     payload.insert("incognito".into(), json!(!cfg.keep_sessions));
-    if !input.thinking_effort.is_empty() && input.thinking_effort != "off" {
+    if !input.thinking_effort.is_empty() {
         payload.insert("thinking_effort".into(), json!(input.thinking_effort));
     }
     if !input.attachments.is_empty() {
@@ -397,10 +420,7 @@ pub fn dial_info(sess: &UpstreamSession) -> Result<DialInfo, UpstreamError> {
 }
 
 fn is_loopback(host: &str) -> bool {
-    host == "localhost"
-        || host.ends_with(".localhost")
-        || host == "::1"
-        || host.starts_with("127.")
+    host == "localhost" || host.ends_with(".localhost") || host == "::1" || host.starts_with("127.")
 }
 
 pub fn proxy_for(ws_url: &str, cfg: &Settings) -> String {
@@ -455,7 +475,10 @@ pub fn proxy_for(ws_url: &str, cfg: &Settings) -> String {
         }
     }
     let secure = to.scheme() == "wss" || to.scheme() == "https";
-    for key in [if secure { "HTTPS_PROXY" } else { "HTTP_PROXY" }, "ALL_PROXY"] {
+    for key in [
+        if secure { "HTTPS_PROXY" } else { "HTTP_PROXY" },
+        "ALL_PROXY",
+    ] {
         let val = read_env(key);
         if val.starts_with("http://") || val.starts_with("https://") {
             return val;
@@ -487,7 +510,11 @@ async fn connect_tcp_maybe_proxy(ws_url: &str, proxy: &str) -> Result<TcpStream,
     }
 
     let pu = Url::parse(proxy).map_err(|e| {
-        UpstreamError::new(UpstreamErrorKind::Transport, format!("invalid proxy url: {e}"), 0)
+        UpstreamError::new(
+            UpstreamErrorKind::Transport,
+            format!("invalid proxy url: {e}"),
+            0,
+        )
     })?;
     let phost = pu.host_str().unwrap_or("127.0.0.1");
     let pport = pu.port_or_known_default().unwrap_or(8080);
@@ -554,7 +581,11 @@ fn delta_text(payload: Option<&Value>) -> String {
     match payload {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Object(obj)) => {
-            if let Some(d) = obj.get("delta").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(d) = obj
+                .get("delta")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 return d.to_string();
             }
             obj.get("text")
@@ -586,10 +617,10 @@ fn error_text(env: &Value) -> String {
         env.get("error_code"),
     ];
     for c in candidates.into_iter().flatten() {
-        if let Some(s) = c.as_str() {
-            if !s.trim().is_empty() {
-                return s.to_string();
-            }
+        if let Some(s) = c.as_str()
+            && !s.trim().is_empty()
+        {
+            return s.to_string();
         }
     }
     "unknown upstream error".to_string()
@@ -602,11 +633,95 @@ fn is_terminal(t: &str) -> bool {
     )
 }
 
+// Each socket carries one turn. Some frames omit the thread ID, but a frame
+// explicitly scoped to another thread must never finish or extend this turn.
+fn on_thread(event: &Value, thread: &str) -> bool {
+    [event.get("thread_id"), event["payload"].get("thread_id")]
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .all(|id| id.is_empty() || id == thread)
+}
+
+fn turn_message_id(event: &Value) -> Option<&str> {
+    [
+        event.get("turn_message_id"),
+        event["payload"].get("turn_message_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .find(|id| !id.is_empty())
+}
+
+fn set_tool_field(field: &mut String, value: String) -> bool {
+    if *field == value {
+        return false;
+    }
+    let advanced = !value.is_empty();
+    *field = value;
+    advanced
+}
+
 fn is_failure(t: &str) -> bool {
     matches!(
         t,
         "error" | "session_error" | "stream_error" | "turn_failed" | "stream_truncated"
     )
+}
+
+fn rejected_thread(code: &str, message: &str) -> bool {
+    matches!(
+        code,
+        "threadnotfound"
+            | "threadexpired"
+            | "sessionnotfound"
+            | "sessionexpired"
+            | "contextwindowexceeded"
+            | "contextlengthexceeded"
+    ) || [
+        "thread no longer exists",
+        "thread not found",
+        "thread has expired",
+        "session no longer exists",
+        "session not found",
+        "session has expired",
+        "context window exceeded",
+        "context length exceeded",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason))
+}
+
+fn advanced_rejected(code: &str, message: &str) -> bool {
+    matches!(
+        code,
+        "advancedmodenotenabled"
+            | "advancedmodedisabled"
+            | "advancedmodenotsupported"
+            | "advancedmodeunavailable"
+            | "unsupportedagentmode"
+    ) || [
+        "advanced mode",
+        "advanced model",
+        "mode 'advanced'",
+        "mode \"advanced\"",
+        "advanced is not",
+    ]
+    .iter()
+    .any(|mode| message.contains(mode))
+        && [
+            "not enabled",
+            "not supported",
+            "not available",
+            "not authorized",
+            "not permitted",
+            "not allowed",
+            "disabled",
+            "access denied",
+        ]
+        .iter()
+        .any(|reason| message.contains(reason))
 }
 
 const QUOTA_NOTICES: &[&str] = &[
@@ -675,11 +790,6 @@ fn push_reply_text(
     }
 }
 
-struct ChunkEntry {
-    parts: Vec<Option<String>>,
-    have: usize,
-}
-
 pub(crate) async fn wait_for_cancellation(cancel: &mut watch::Receiver<bool>) {
     let closed = cancel.wait_for(|&cancelled| cancelled).await.is_err();
     if closed {
@@ -710,7 +820,11 @@ pub async fn chat(
 
     let proxy = proxy_for(&dial.url, cfg);
     let mut ws_req = dial.url.as_str().into_client_request().map_err(|e| {
-        UpstreamError::new(UpstreamErrorKind::Transport, format!("ws request error: {e}"), 0)
+        UpstreamError::new(
+            UpstreamErrorKind::Transport,
+            format!("ws request error: {e}"),
+            0,
+        )
     })?;
     for (k, v) in &dial.headers {
         if let (Ok(name), Ok(val)) = (
@@ -728,7 +842,10 @@ pub async fn chat(
             .map_err(|e| match &e {
                 tokio_tungstenite::tungstenite::Error::Http(resp) => UpstreamError::new(
                     UpstreamErrorKind::Handshake,
-                    format!("upstream WebSocket dial failed HTTP {}", resp.status().as_u16()),
+                    format!(
+                        "upstream WebSocket dial failed HTTP {}",
+                        resp.status().as_u16()
+                    ),
                     resp.status().as_u16(),
                 ),
                 other => UpstreamError::new(
@@ -749,16 +866,16 @@ pub async fn chat(
     };
     let mut ws = connected.map_err(|_| {
         UpstreamError::new(
-            UpstreamErrorKind::Timeout,
+            UpstreamErrorKind::Handshake,
             "upstream WebSocket handshake timed out",
-            0,
+            504,
         )
     })??;
 
     let send_frame = async |ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<TcpStream>,
     >,
-                                val: &Value|
+                            val: &Value|
            -> Result<(), UpstreamError> {
         // AIDP 出站帧为 UTF-8 JSON，与原客户端一致以 Binary 帧发送。
         let bytes = encode_frame(val);
@@ -784,7 +901,11 @@ pub async fn chat(
     )
     .await?;
     // 2. 发送 federate_status 同步帧
-    send_frame(&mut ws, &json!({ "type": "federate_status", "payload": {} })).await?;
+    send_frame(
+        &mut ws,
+        &json!({ "type": "federate_status", "payload": {} }),
+    )
+    .await?;
     // 3. 若启用了 keep_sessions 且为新会话，创建远端会话记录
     if cfg.keep_sessions && !input.resume {
         send_frame(
@@ -800,13 +921,17 @@ pub async fn chat(
     if *cancel_rx.borrow() {
         return Err(UpstreamError::cancelled());
     }
-    let mut turn_input = input.clone();
-    turn_input.thread_id = thread_id.clone();
-    let um = user_message(session, cfg, &turn_input);
-    send_frame(&mut ws, &um).await?;
+    let sent_turn_id = {
+        let mut turn_input = input.clone();
+        turn_input.thread_id = thread_id.clone();
+        let um = user_message(session, cfg, &turn_input);
+        send_frame(&mut ws, &um).await?;
+        um["payload"]["message_id"].as_str().map(str::to_owned)
+    };
+    let mut observed_turn_id: Option<String> = None;
 
     let mut usage = UpstreamUsage::default();
-    let mut chunks: HashMap<String, ChunkEntry> = HashMap::new();
+    let mut chunks = ChunkBuffer::default();
     let mut tools: Vec<QuickToolCall> = Vec::new();
     let mut tool_index: HashMap<String, usize> = HashMap::new();
     let mut sent_tools: HashSet<String> = HashSet::new();
@@ -816,13 +941,27 @@ pub async fn chat(
     let mut thought = String::new();
     let mut live = true;
 
-    let keepalive_dur = Duration::from_millis(if cfg.keepalive_ms > 0 { cfg.keepalive_ms } else { 25_000 });
+    let keepalive_dur = Duration::from_millis(if cfg.keepalive_ms > 0 {
+        cfg.keepalive_ms
+    } else {
+        25_000
+    });
     let mut ping_interval = tokio::time::interval(keepalive_dur);
     ping_interval.tick().await; // 跳过首次立即触发的 tick
 
-    let req_deadline = tokio::time::Instant::now() + Duration::from_millis(cfg.request_timeout_ms);
-    let mut idle_deadline = tokio::time::Instant::now() + Duration::from_secs(READ_IDLE_SECS);
-    let mut complete_deadline: Option<tokio::time::Instant> = None;
+    let request_timeout = Duration::from_millis(cfg.request_timeout_ms);
+    let idle_timeout = Duration::from_secs(READ_IDLE_SECS);
+    let now = Instant::now();
+    let mut req_deadline = now + request_timeout;
+    // Give active streams an extra response budget while keeping a hard ceiling.
+    let hard_deadline = if cfg.extend_active_request_timeout && events_tx.is_some() {
+        req_deadline + request_timeout
+    } else {
+        req_deadline
+    };
+    let progress_grace = idle_timeout.min(request_timeout);
+    let mut idle_deadline = now + idle_timeout;
+    let mut complete_deadline: Option<Instant> = None;
 
     let emit = |ev: UpstreamEvent| {
         if let Some(tx) = &events_tx {
@@ -835,14 +974,21 @@ pub async fn chat(
     // 迭代式事件处理队列，便于在 `_chunked_frame` 重组完成后继续入队处理。
     let mut handle_envelope = |root_env: Value,
                                live: &mut bool,
-                               complete_deadline: &mut Option<tokio::time::Instant>|
+                               complete_deadline: &mut Option<Instant>,
+                               request_deadline: &mut Instant,
+                               idle_deadline: &mut Instant|
      -> Option<Result<(), UpstreamError>> {
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(root_env);
         while let Some(env) = queue.pop_front() {
+            if !on_thread(&env, &thread_id) {
+                continue;
+            }
             let typ = env.get("type").and_then(|v| v.as_str()).unwrap_or("");
             let p_val = env.get("payload");
             let p = p_val.and_then(|v| v.as_object());
+            let output_before = (text.len(), thought.len());
+            let mut tool_advanced = false;
 
             if (is_failure(typ) || typ == "guardrail_blocked") && is_quota_error(&env) {
                 *live = false;
@@ -852,42 +998,10 @@ pub async fn chat(
             match typ {
                 "_chunked_frame" => {
                     let src = p_val.filter(|v| v.is_object()).unwrap_or(&env);
-                    let cid = src.get("chunk_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let idx = src.get("chunk_index").and_then(|v| v.as_u64());
-                    let total = src.get("total_chunks").and_then(|v| v.as_u64());
-                    let data = src.get("data").and_then(|v| v.as_str());
-                    if let (Some(idx), Some(total), Some(data)) = (idx, total, data) {
-                        let (idx, total) = (idx as usize, total as usize);
-                        if !cid.is_empty() && (1..=4096).contains(&total) && idx < total {
-                            let entry = chunks.entry(cid.to_string()).or_insert_with(|| ChunkEntry {
-                                parts: vec![None; total],
-                                have: 0,
-                            });
-                            if entry.parts.len() != total {
-                                *entry = ChunkEntry {
-                                    parts: vec![None; total],
-                                    have: 0,
-                                };
-                            }
-                            if entry.parts[idx].is_none() {
-                                entry.have += 1;
-                            }
-                            entry.parts[idx] = Some(data.to_string());
-                            if entry.have >= total {
-                                if let Some(done_entry) = chunks.remove(cid) {
-                                    let joined: String = done_entry
-                                        .parts
-                                        .into_iter()
-                                        .flatten()
-                                        .collect();
-                                    if let Ok(parsed) = serde_json::from_str::<Value>(&joined) {
-                                        if parsed.is_object() {
-                                            queue.push_back(parsed);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    match chunks.push(src) {
+                        Ok(Some(parsed)) => queue.push_back(parsed),
+                        Ok(None) => {}
+                        Err(error) => return Some(Err(error)),
                     }
                 }
                 "thinking_delta" => {
@@ -933,7 +1047,12 @@ pub async fn chat(
                             .unwrap_or("")
                             .trim();
                         let known = !tid.is_empty() && tool_index.contains_key(tid);
-                        let id = if tid.is_empty() { call_id() } else { tid.to_string() };
+                        tool_advanced = !tid.is_empty() && !known;
+                        let id = if tid.is_empty() {
+                            call_id()
+                        } else {
+                            tid.to_string()
+                        };
                         let idx = *tool_index.entry(id.clone()).or_insert_with(|| {
                             tools.push(QuickToolCall {
                                 id: id.clone(),
@@ -944,14 +1063,15 @@ pub async fn chat(
                             });
                             tools.len() - 1
                         });
-                        if let Some(n) = o.get("tool_name").and_then(|v| v.as_str()) {
-                            if !n.trim().is_empty() {
-                                tools[idx].name = n.trim().to_string();
-                            }
+                        if let Some(n) = o.get("tool_name").and_then(|v| v.as_str())
+                            && !n.trim().is_empty()
+                        {
+                            tool_advanced |=
+                                set_tool_field(&mut tools[idx].name, n.trim().to_string());
                         }
                         let args = argument_string(o.get("arguments"));
                         if args != "{}" {
-                            tools[idx].arguments = args;
+                            tool_advanced |= set_tool_field(&mut tools[idx].arguments, args);
                         }
                         if !known && cfg.show_quick_tools && !tools[idx].name.is_empty() {
                             let prefix = if !thought.is_empty() && !thought.ends_with('\n') {
@@ -963,6 +1083,7 @@ pub async fn chat(
                             thought.push_str(&note);
                             emit(UpstreamEvent::Reasoning(note));
                         }
+                        tool_advanced &= !tid.is_empty();
                     }
                 }
                 "tool_arguments" | "tool_arguments_edited" | "tool_call" | "tool_call_update" => {
@@ -974,7 +1095,11 @@ pub async fn chat(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .trim();
-                        let id = if tid.is_empty() { call_id() } else { tid.to_string() };
+                        let id = if tid.is_empty() {
+                            call_id()
+                        } else {
+                            tid.to_string()
+                        };
                         let idx = *tool_index.entry(id.clone()).or_insert_with(|| {
                             tools.push(QuickToolCall {
                                 id: id.clone(),
@@ -989,10 +1114,10 @@ pub async fn chat(
                             .get("tool_name")
                             .or_else(|| o.get("title"))
                             .and_then(|v| v.as_str())
+                            && !n.trim().is_empty()
                         {
-                            if !n.trim().is_empty() {
-                                tools[idx].name = n.trim().to_string();
-                            }
+                            tool_advanced |=
+                                set_tool_field(&mut tools[idx].name, n.trim().to_string());
                         }
                         if let Some(args) = o
                             .get("rawInput")
@@ -1000,8 +1125,12 @@ pub async fn chat(
                             .or_else(|| o.get("arguments"))
                             .filter(|v| !v.is_null())
                         {
-                            tools[idx].arguments = argument_string(Some(args));
+                            tool_advanced |= set_tool_field(
+                                &mut tools[idx].arguments,
+                                argument_string(Some(args)),
+                            );
                         }
+                        tool_advanced &= !tid.is_empty();
                         let tc = tools[idx].clone();
                         if sent_tools.insert(tc.id.clone()) {
                             emit(UpstreamEvent::ToolCall(tc));
@@ -1023,7 +1152,8 @@ pub async fn chat(
                             .or_else(|| o.get("progress").and_then(|pr| pr.get("input_delta")))
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        if !tid.is_empty() && !delta.is_empty() {
+                        if !tid.trim().is_empty() && !delta.is_empty() {
+                            tool_advanced = true;
                             partial_args
                                 .entry(tid.to_string())
                                 .or_default()
@@ -1040,7 +1170,11 @@ pub async fn chat(
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .trim();
-                        let id = if tid.is_empty() { call_id() } else { tid.to_string() };
+                        let id = if tid.is_empty() {
+                            call_id()
+                        } else {
+                            tid.to_string()
+                        };
                         let idx = *tool_index.entry(id.clone()).or_insert_with(|| {
                             tools.push(QuickToolCall {
                                 id: id.clone(),
@@ -1051,29 +1185,49 @@ pub async fn chat(
                             });
                             tools.len() - 1
                         });
-                        if let Some(n) = o.get("tool_name").and_then(|v| v.as_str()) {
-                            if !n.trim().is_empty() {
-                                tools[idx].name = n.trim().to_string();
-                            }
+                        if let Some(n) = o.get("tool_name").and_then(|v| v.as_str())
+                            && !n.trim().is_empty()
+                        {
+                            tool_advanced |=
+                                set_tool_field(&mut tools[idx].name, n.trim().to_string());
                         }
                         if typ == "tool_result" {
                             if let Some(args) = o.get("arguments").filter(|v| !v.is_null()) {
-                                tools[idx].arguments = argument_string(Some(args));
+                                tool_advanced |= set_tool_field(
+                                    &mut tools[idx].arguments,
+                                    argument_string(Some(args)),
+                                );
                             }
                             if let Some(err) = o.get("error").filter(|v| !v.is_null()) {
-                                tools[idx].result = raw_text(Some(err));
-                                tools[idx].status = "error".to_string();
+                                tool_advanced |=
+                                    set_tool_field(&mut tools[idx].result, raw_text(Some(err)));
+                                tool_advanced |=
+                                    set_tool_field(&mut tools[idx].status, "error".to_string());
                             } else {
-                                tools[idx].result = raw_text(o.get("result"));
-                                tools[idx].status = raw_text(o.get("status"));
+                                tool_advanced |= set_tool_field(
+                                    &mut tools[idx].result,
+                                    raw_text(o.get("result")),
+                                );
+                                let status = o
+                                    .get("status")
+                                    .and_then(Value::as_str)
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("complete");
+                                tool_advanced |=
+                                    set_tool_field(&mut tools[idx].status, status.to_owned());
                             }
                         } else if typ == "tool_error" {
-                            tools[idx].status = "error".to_string();
-                            tools[idx].result =
-                                raw_text(o.get("error").or_else(|| o.get("message")));
-                        } else if tools[idx].status.is_empty() {
-                            tools[idx].status = "complete".to_string();
+                            tool_advanced |=
+                                set_tool_field(&mut tools[idx].status, "error".to_string());
+                            tool_advanced |= set_tool_field(
+                                &mut tools[idx].result,
+                                raw_text(o.get("error").or_else(|| o.get("message"))),
+                            );
+                        } else if tools[idx].status != "error" {
+                            tool_advanced |=
+                                set_tool_field(&mut tools[idx].status, "complete".to_owned());
                         }
+                        tool_advanced &= !tid.is_empty();
                         let tc = tools[idx].clone();
                         if sent_tools.insert(tc.id.clone()) {
                             emit(UpstreamEvent::ToolCall(tc));
@@ -1093,7 +1247,9 @@ pub async fn chat(
                         return Some(Err(UpstreamError::quota()));
                     }
 
-                    if let Some(items) = p.and_then(|o| o.get("tool_calls")).and_then(|v| v.as_array())
+                    if let Some(items) = p
+                        .and_then(|o| o.get("tool_calls"))
+                        .and_then(|v| v.as_array())
                     {
                         for item in items {
                             let tid = item
@@ -1102,7 +1258,11 @@ pub async fn chat(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .trim();
-                            let id = if tid.is_empty() { call_id() } else { tid.to_string() };
+                            let id = if tid.is_empty() {
+                                call_id()
+                            } else {
+                                tid.to_string()
+                            };
                             let idx = *tool_index.entry(id.clone()).or_insert_with(|| {
                                 tools.push(QuickToolCall {
                                     id: id.clone(),
@@ -1118,10 +1278,9 @@ pub async fn chat(
                                 .or_else(|| item.get("tool_name"))
                                 .or_else(|| item.get("function").and_then(|f| f.get("name")))
                                 .and_then(|v| v.as_str())
+                                && !n.trim().is_empty()
                             {
-                                if !n.trim().is_empty() {
-                                    tools[idx].name = n.trim().to_string();
-                                }
+                                tools[idx].name = n.trim().to_string();
                             }
                             if let Some(args) = item
                                 .get("arguments")
@@ -1149,21 +1308,45 @@ pub async fn chat(
                         let code = p
                             .and_then(|o| o.get("code"))
                             .or_else(|| env.get("code"))
+                            .or_else(|| p.and_then(|o| o.get("error_code")))
+                            .or_else(|| env.get("error_code"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         let msg = error_text(&env);
-                        if code == "FrameTooLarge" {
-                            return Some(Err(UpstreamError::new(
-                                UpstreamErrorKind::TooLarge,
-                                msg,
-                                400,
-                            )));
-                        }
-                        return Some(Err(UpstreamError::new(
-                            UpstreamErrorKind::Upstream,
-                            format!("upstream {typ}: {msg}"),
-                            502,
-                        )));
+                        let code: String = code
+                            .bytes()
+                            .filter(u8::is_ascii_alphanumeric)
+                            .map(|byte| byte.to_ascii_lowercase() as char)
+                            .collect();
+                        let message = msg.to_ascii_lowercase();
+                        let before_progress =
+                            text.is_empty() && thought.is_empty() && tools.is_empty();
+                        let (kind, status) = if code == "frametoolarge" {
+                            (UpstreamErrorKind::TooLarge, 400)
+                        } else if before_progress
+                            && input.resume
+                            && rejected_thread(&code, &message)
+                        {
+                            (UpstreamErrorKind::ThreadRejected, 502)
+                        } else if before_progress
+                            && input.model == "advanced"
+                            && advanced_rejected(&code, &message)
+                        {
+                            (UpstreamErrorKind::AdvancedUnavailable, 403)
+                        } else if before_progress
+                            && input.model == "advanced"
+                            && message.trim_start().starts_with("something went wrong")
+                        {
+                            (UpstreamErrorKind::AdvancedEntitlementUnconfirmed, 502)
+                        } else {
+                            (UpstreamErrorKind::Upstream, 502)
+                        };
+                        let message = if kind == UpstreamErrorKind::TooLarge {
+                            msg
+                        } else {
+                            format!("upstream {typ}: {msg}")
+                        };
+                        return Some(Err(UpstreamError::new(kind, message, status)));
                     }
                     if is_terminal(typ) {
                         *live = false;
@@ -1177,6 +1360,30 @@ pub async fn chat(
                         return Some(Ok(()));
                     }
                 }
+            }
+            let advanced = tool_advanced
+                || (matches!(
+                    typ,
+                    "thinking_delta" | "text_delta" | "text_complete" | "message_complete"
+                ) && (text.len(), thought.len()) != output_before);
+            let now = Instant::now();
+            if advanced
+                && let Some(id) = turn_message_id(&env)
+                && observed_turn_id.as_deref() != Some(id)
+            {
+                observed_turn_id = Some(id.to_owned());
+            }
+            if advanced
+                || matches!(
+                    typ,
+                    "message_start" | "message_complete" | "turn_usage" | "_chunked_frame"
+                )
+            {
+                *idle_deadline = now + idle_timeout;
+            }
+            if advanced && *request_deadline < hard_deadline {
+                let grace_deadline = (now + progress_grace).min(hard_deadline);
+                *request_deadline = (*request_deadline).max(grace_deadline);
             }
         }
         None
@@ -1274,15 +1481,7 @@ pub async fn chat(
                         for frame in frames {
                             let Ok(env) = serde_json::from_str::<Value>(&frame) else { continue };
                             if !env.is_object() { continue; }
-                            let kind = env["type"].as_str().unwrap_or("");
-                            if kind.starts_with("tool_") || matches!(
-                                kind,
-                                "thinking_delta" | "text_delta" | "text_complete" | "message_start"
-                                    | "message_complete" | "turn_usage" | "_chunked_frame"
-                            ) {
-                                idle_deadline = tokio::time::Instant::now() + Duration::from_secs(READ_IDLE_SECS);
-                            }
-                            if let Some(done) = handle_envelope(env, &mut live, &mut complete_deadline) {
+                            if let Some(done) = handle_envelope(env, &mut live, &mut complete_deadline, &mut req_deadline, &mut idle_deadline) {
                                 finish_result = Some(done);
                                 break;
                             }
@@ -1296,11 +1495,17 @@ pub async fn chat(
         }
     }
 
+    drop(chunks);
     // 若上游仍在生成阶段提前退出，主动发送 `stop_generation` 优雅终止。
+    let mut stopped = !live;
     if live {
         let stop_msg = json!({ "type": "stop_generation", "payload": { "thread_id": thread_id } });
-        if send_frame(&mut ws, &stop_msg).await.is_ok() {
-            let settle = tokio::time::Instant::now() + Duration::from_millis(STOP_SETTLE_MS);
+        let settle = Instant::now() + Duration::from_millis(STOP_SETTLE_MS);
+        let expected_turn = observed_turn_id.as_deref().or(sent_turn_id.as_deref());
+        if matches!(
+            tokio::time::timeout_at(settle, send_frame(&mut ws, &stop_msg)).await,
+            Ok(Ok(()))
+        ) {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep_until(settle) => break,
@@ -1312,18 +1517,19 @@ pub async fn chat(
                             Message::Close(_) => break,
                             _ => continue,
                         };
-                        let mut done = false;
                         for frame in frames {
                             let Ok(event) = serde_json::from_str::<Value>(&frame) else { continue };
+                            if !on_thread(&event, &thread_id) { continue; }
+                            if turn_message_id(&event).is_some_and(|id| Some(id) != expected_turn) { continue; }
                             let kind = event["type"].as_str().unwrap_or("");
-                            if kind == "turn_usage" {
-                                if let Some(payload) = event["payload"].as_object() {
+                            if kind == "turn_usage"
+                                && let Some(payload) = event["payload"].as_object() {
                                     usage.record(payload);
                                 }
-                            }
-                            done |= kind == "message_complete" || is_terminal(kind) || is_failure(kind);
+                            stopped |= is_terminal(kind) || (kind == "message_complete" &&
+                                matches!(event["payload"].get("continuation_expected"), None | Some(Value::Bool(false))));
                         }
-                        if done { break; }
+                        if stopped { break; }
                     }
                 }
             }
@@ -1344,10 +1550,7 @@ pub async fn chat(
                     tc.name = "unknown".to_string();
                 }
                 if tc.arguments.trim().is_empty() {
-                    let partial = partial_args
-                        .get(&tc.id)
-                        .map(|s| s.trim())
-                        .unwrap_or("");
+                    let partial = partial_args.get(&tc.id).map(|s| s.trim()).unwrap_or("");
                     if !partial.is_empty() && serde_json::from_str::<Value>(partial).is_ok() {
                         tc.arguments = partial.to_string();
                     } else {
@@ -1361,6 +1564,14 @@ pub async fn chat(
                 usage,
             })
         }
-        Err(e) => Err(e.with_reported_usage(usage)),
+        Err(mut e) => {
+            if matches!(
+                e.kind,
+                UpstreamErrorKind::Timeout | UpstreamErrorKind::Cancelled
+            ) {
+                e.can_resume_thread = stopped;
+            }
+            Err(e.with_reported_usage(usage))
+        }
     }
 }

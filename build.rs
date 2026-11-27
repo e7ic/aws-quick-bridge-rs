@@ -7,10 +7,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rustc-cfg=macos_bundle_fonts");
     }
 
-    #[cfg(target_os = "windows")]
-    if std::env::var_os("CARGO_FEATURE_GUI").is_some() {
+    #[cfg(feature = "gui")]
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-changed=assets/app-icon.rc");
         println!("cargo:rerun-if-changed=assets/app-icon.ico");
+        println!("cargo:rerun-if-changed=assets/tray-on-light.ico");
+        println!("cargo:rerun-if-changed=assets/tray-on-dark.ico");
         embed_resource::compile_for(
             "assets/app-icon.rc",
             ["aws-quick-bridge-gui", "aws-quick-bridge-rs"],

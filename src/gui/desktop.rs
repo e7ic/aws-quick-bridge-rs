@@ -6,12 +6,14 @@ pub(super) mod claude_link;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub(super) use macos::{configure_application, prefers_reduced_motion, show_window};
+pub(super) use macos::{
+    configure_application, prefers_reduced_motion, set_main_window, show_window,
+};
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub(super) use windows::{keep_window_in_background, prefers_reduced_motion};
+pub(super) use windows::{keep_window_in_background, prefers_reduced_motion, sync_window_caption};
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(super) fn prefers_reduced_motion() -> bool {
@@ -28,8 +30,8 @@ pub(super) fn keep_window_in_background(window: &Window, cx: &App) {
 }
 
 #[cfg(target_os = "macos")]
-fn background_window(_: &mut Window, cx: &mut App) {
-    macos::hide_window(cx);
+fn background_window(window: &mut Window, cx: &mut App) {
+    macos::hide_window(window, cx);
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

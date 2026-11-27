@@ -32,7 +32,8 @@ impl HighlightFade {
     }
 
     fn is_animating(&self, now: Instant) -> bool {
-        !is_reduced_motion() && now.saturating_duration_since(self.started_at) < CONTENT_FADE_DURATION
+        !is_reduced_motion()
+            && now.saturating_duration_since(self.started_at) < CONTENT_FADE_DURATION
     }
 }
 

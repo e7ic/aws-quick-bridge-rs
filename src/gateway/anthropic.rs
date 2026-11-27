@@ -181,7 +181,10 @@ fn convert_messages(list: &[Value]) -> Vec<Value> {
                     }
                 }
                 "image" => {
-                    parts.push(image_part(b).unwrap_or_else(|| json!({ "type": "text", "text": "[image]" })));
+                    parts.push(
+                        image_part(b)
+                            .unwrap_or_else(|| json!({ "type": "text", "text": "[image]" })),
+                    );
                 }
                 "document" => {
                     let title = b.get("title").and_then(|v| v.as_str()).unwrap_or("");
@@ -216,23 +219,22 @@ fn convert_messages(list: &[Value]) -> Vec<Value> {
     out
 }
 
-fn effort_from_body(body: &Value) -> Option<String> {
+fn effort_from_body(body: &Value) -> Option<&str> {
+    let thinking = &body["thinking"];
+    let thinking_type = thinking["type"].as_str();
+    if thinking_type == Some("disabled") {
+        return Some("off");
+    }
+
     if let Some(asked) = body
         .get("output_config")
         .and_then(|o| o.get("effort"))
         .and_then(|v| v.as_str())
+        .filter(|value| !value.trim().is_empty())
     {
-        let low = asked.to_ascii_lowercase();
-        if !low.is_empty() {
-            return Some(if low == "max" || low == "xhigh" {
-                "high".to_string()
-            } else {
-                low
-            });
-        }
+        return Some(asked);
     }
-    let thinking = body.get("thinking")?;
-    if thinking.get("type").and_then(|v| v.as_str()) != Some("enabled") {
+    if thinking_type != Some("enabled") {
         return None;
     }
     let budget = thinking.get("budget_tokens").and_then(|v| v.as_u64())?;
@@ -243,10 +245,11 @@ fn effort_from_body(body: &Value) -> Option<String> {
         "low"
     } else if budget < 16_000 {
         "medium"
-    } else {
+    } else if budget < 32_000 {
         "high"
-    }
-    .to_string())
+    } else {
+        "max"
+    })
 }
 
 pub struct AnthropicRequest {
@@ -308,7 +311,8 @@ pub fn to_chat(body: &Value) -> AnthropicRequest {
             "none" => chat["tool_choice"] = json!("none"),
             "tool" => {
                 if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
-                    chat["tool_choice"] = json!({ "type": "function", "function": { "name": name } });
+                    chat["tool_choice"] =
+                        json!({ "type": "function", "function": { "name": name } });
                 }
             }
             _ => {}
@@ -380,7 +384,7 @@ pub fn count_tokens(body: &Value) -> Response {
         body.get("tools").cloned().unwrap_or(json!([])),
     ]);
     let chars = serde_json::to_string(&sample).map(|s| s.len()).unwrap_or(0);
-    let est = ((chars + 3) / 4).max(1);
+    let est = chars.div_ceil(4).max(1);
     axum::Json(json!({ "input_tokens": est })).into_response()
 }
 
@@ -397,7 +401,9 @@ pub fn from_chat_output(
         ChatOutput::Completed(res) => {
             let mut content = Vec::new();
             if show_thinking && !res.reasoning.is_empty() {
-                content.push(json!({ "type": "thinking", "thinking": res.reasoning, "signature": "" }));
+                content.push(
+                    json!({ "type": "thinking", "thinking": res.reasoning, "signature": "" }),
+                );
             }
             if !res.text.is_empty() {
                 content.push(json!({ "type": "text", "text": res.text }));
@@ -433,7 +439,10 @@ pub fn from_chat_output(
             let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
             tokio::spawn(async move {
                 let send = |event: &str, data: &Value| {
-                    let frame = format!("event: {event}\ndata: {}\n\n", serde_json::to_string(data).unwrap_or_default());
+                    let frame = format!(
+                        "event: {event}\ndata: {}\n\n",
+                        serde_json::to_string(data).unwrap_or_default()
+                    );
                     let _ = tx.send(Ok(Bytes::from(frame)));
                 };
 
@@ -476,7 +485,10 @@ pub fn from_chat_output(
                     *open = "";
                 };
 
-                let open_block = |open: &mut &'static str, index: &mut i32, kind: &'static str, content_block: Value| {
+                let open_block = |open: &mut &'static str,
+                                  index: &mut i32,
+                                  kind: &'static str,
+                                  content_block: Value| {
                     if *open == kind && kind != "tool_use" {
                         return;
                     }
@@ -498,14 +510,24 @@ pub fn from_chat_output(
                             if !show_thinking {
                                 continue;
                             }
-                            open_block(&mut open, &mut index, "thinking", json!({ "type": "thinking", "thinking": "", "signature": "" }));
+                            open_block(
+                                &mut open,
+                                &mut index,
+                                "thinking",
+                                json!({ "type": "thinking", "thinking": "", "signature": "" }),
+                            );
                             send(
                                 "content_block_delta",
                                 &json!({ "type": "content_block_delta", "index": index, "delta": { "type": "thinking_delta", "thinking": r } }),
                             );
                         }
                         TurnEvent::Text(t) => {
-                            open_block(&mut open, &mut index, "text", json!({ "type": "text", "text": "" }));
+                            open_block(
+                                &mut open,
+                                &mut index,
+                                "text",
+                                json!({ "type": "text", "text": "" }),
+                            );
                             send(
                                 "content_block_delta",
                                 &json!({ "type": "content_block_delta", "index": index, "delta": { "type": "text_delta", "text": t } }),

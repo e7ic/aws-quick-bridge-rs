@@ -1,52 +1,28 @@
 //! Exercises the real HTTP gateway with a local Quick server and fixture credentials.
 
-use aws_quick_bridge_rs::config::{
-    AccountRecord, AccountsFile, BridgeConfig, save_accounts, save_config,
-};
+use aws_quick_bridge_rs::config::{AccountsFile, BridgeConfig, save_accounts, save_config};
 use aws_quick_bridge_rs::gateway::{RunningServer, start_server};
 use aws_quick_bridge_rs::pool::{AccountHealth, AccountPool};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::{Message, handshake::server::Request};
+use tokio_tungstenite::tungstenite::handshake::server::Request;
+
+#[path = "support/quick.rs"]
+mod quick;
+use quick::{account, complete, receive, send};
 
 const SIGN_IN: &str = "test-gateway-key";
 const LIMIT_NOTICE: &str = "You've reached your usage limit. Check your profile for details.";
 const DESKTOP_COMMAND: &str = r#"cd "$TEMP" && printf '%s' '“示例”'"#;
 
-async fn receive(ws: &mut WebSocketStream<TcpStream>) -> Option<Value> {
-    while let Some(msg) = ws.next().await {
-        if let Ok(Message::Binary(bytes)) = msg {
-            let outer: Value = serde_json::from_slice(&bytes).unwrap();
-            let bytes = STANDARD
-                .decode(outer["payload"]["payload"].as_str().unwrap())
-                .unwrap();
-            return Some(serde_json::from_slice(&bytes).unwrap());
-        }
-    }
-    None
-}
-
-async fn send(ws: &mut WebSocketStream<TcpStream>, event: &str, payload: Value) {
-    ws.send(Message::text(
-        json!({ "type": event, "payload": payload }).to_string(),
-    ))
-    .await
-    .unwrap();
-}
-
-async fn complete(ws: &mut WebSocketStream<TcpStream>) {
-    send(ws, "message_complete", json!({})).await;
-    send(ws, "turn_completed", json!({})).await;
-}
-
+#[expect(
+    clippy::result_large_err,
+    reason = "Tungstenite defines the handshake callback response type"
+)]
 async fn quick_turn(
     stream: TcpStream,
     turns: mpsc::UnboundedSender<(String, Value)>,
@@ -90,6 +66,15 @@ async fn quick_turn(
                     &mut ws,
                     "session_error",
                     json!({"message":"Quick thread no longer exists"}),
+                )
+                .await;
+                return;
+            }
+            if text == "rebuild full context" {
+                send(
+                    &mut ws,
+                    "session_error",
+                    json!({"error_code":"context_window_exceeded"}),
                 )
                 .await;
                 return;
@@ -176,18 +161,6 @@ async fn quick_turn(
         }
         return;
     }
-}
-
-fn account(id: &str, quick_port: u16, usage_port: u16) -> AccountRecord {
-    serde_json::from_value(json!({
-        "access": format!("fixture-{id}"),
-        "accountId": id,
-        "email": id,
-        "expires": chrono::Utc::now().timestamp_millis() + 3_600_000,
-        "tenantUrl": format!("http://127.0.0.1:{usage_port}"),
-        "wsHost": format!("ws://127.0.0.1:{quick_port}"),
-    }))
-    .unwrap()
 }
 
 fn request(
@@ -429,36 +402,33 @@ async fn resumes_after_restart_fails_over_on_quota_and_stops_on_disconnect() {
         Some(262_144)
     );
 
-    request(
-        &client,
-        &running,
-        json!([
-            {"role":"user","content":"remember this question"},
-            {"role":"assistant","content":"fixture answer"},
-            {"role":"user","content":"continue"},
-            {"role":"assistant","content":"fixture answer"},
-            {"role":"user","content":"rebuild old thread"}
-        ]),
-        false,
-    )
-    .send()
-    .await
-    .unwrap()
-    .error_for_status()
-    .unwrap()
-    .bytes()
-    .await
-    .unwrap();
-    let (_, stale) = turns.recv().await.unwrap();
-    let (_, rebuilt) = turns.recv().await.unwrap();
-    assert_eq!(stale["thread_id"], continuation["thread_id"]);
-    assert_ne!(rebuilt["thread_id"], stale["thread_id"]);
-    assert!(
-        rebuilt["text"]
-            .as_str()
+    let mut history = vec![
+        json!({"role":"user","content":"remember this question"}),
+        json!({"role":"assistant","content":"fixture answer"}),
+        json!({"role":"user","content":"continue"}),
+        json!({"role":"assistant","content":"fixture answer"}),
+    ];
+    let mut previous = continuation["thread_id"].clone();
+    for next in ["rebuild old thread", "rebuild full context"] {
+        history.push(json!({"role":"user","content":next}));
+        request(&client, &running, json!(history), false)
+            .send()
+            .await
             .unwrap()
-            .contains("remember this question")
-    );
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let (_, stale) = turns.recv().await.unwrap();
+        let (_, rebuilt) = turns.recv().await.unwrap();
+        assert_eq!(stale["thread_id"], previous);
+        assert_ne!(rebuilt["thread_id"], stale["thread_id"]);
+        let text = rebuilt["text"].as_str().unwrap();
+        assert!(text.contains("remember this question") && text.contains(next));
+        previous = rebuilt["thread_id"].clone();
+        history.push(json!({"role":"assistant","content":"fixture answer"}));
+    }
 
     let quote = request(
         &client,

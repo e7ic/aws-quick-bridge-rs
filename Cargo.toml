@@ -1,6 +1,6 @@
 [package]
 name = "aws-quick-bridge-rs"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 default-run = "aws-quick-bridge-rs"
 description = "Rust implementation of Amazon Quick (QuickWork) bridge with Magpie-style multi-account pool, Anthropic/OpenAI gateway, CC Switch integration, and GPUI desktop app."
@@ -8,7 +8,7 @@ license = "GPL-3.0-only"
 
 [features]
 default = ["gui"]
-gui = ["dep:gpui", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:raw-window-handle", "dep:tempfile", "dep:windows-sys"]
+gui = ["dep:block2", "dep:embed-resource", "dep:gpui", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:raw-window-handle", "dep:tempfile", "dep:windows-sys"]
 
 [dependencies]
 # 异步运行时与网络栈
@@ -51,27 +51,37 @@ parking_lot = "0.13"
 gpui = { version = "0.2.2", features = ["runtime_shaders"], optional = true }
 tempfile = { version = "3.27", optional = true }
 
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+raw-window-handle = { version = "0.6", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6", optional = true }
 objc2 = { version = "0.6.5", optional = true }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
-    "std", "objc2-core-foundation", "NSAccessibility", "NSApplication", "NSButton",
-    "NSControl", "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication",
-    "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "NSWindow", "NSWorkspace",
+    "std", "block2", "objc2-core-foundation", "NSAccessibility", "NSApplication", "NSButton",
+    "NSControl", "NSEvent", "NSGraphics", "NSImage", "NSPanel", "NSResponder", "NSRunningApplication",
+    "NSScreen", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "NSWindow", "NSWorkspace",
 ], optional = true }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSString"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSData", "NSString", "NSValue"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-raw-window-handle = { version = "0.6", optional = true }
 windows-sys = { version = "0.61", optional = true, features = [
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_Accessibility",
     "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-[target.'cfg(target_os = "windows")'.build-dependencies]
-embed-resource = "3.0.12"
+[build-dependencies]
+embed-resource = { version = "3.0.12", optional = true }
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["ico"] }
+resvg = { version = "0.45", default-features = false }
 tempfile = "3.27"

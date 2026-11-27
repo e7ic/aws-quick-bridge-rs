@@ -51,10 +51,10 @@ pub fn unwrap_response(text: &str) -> (u16, Value) {
         .or_else(|| outer.get("invokeAgentResponse"))
         .cloned()
         .unwrap_or(outer);
-    if let Value::String(s) = &inner {
-        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-            inner = parsed;
-        }
+    if let Value::String(s) = &inner
+        && let Ok(parsed) = serde_json::from_str::<Value>(s)
+    {
+        inner = parsed;
     }
     let Some(obj) = inner.as_object() else {
         return (200, inner);
@@ -67,10 +67,10 @@ pub fn unwrap_response(text: &str) -> (u16, Value) {
         .filter(|&n| n > 0)
         .unwrap_or(200);
     let mut body = obj.get("body").cloned().unwrap_or(inner);
-    if let Value::String(s) = &body {
-        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-            body = parsed;
-        }
+    if let Value::String(s) = &body
+        && let Ok(parsed) = serde_json::from_str::<Value>(s)
+    {
+        body = parsed;
     }
     (status, body)
 }
@@ -138,22 +138,32 @@ pub async fn invoke(
 
 fn parse_iso_time(val: Option<&Value>) -> Option<DateTime<Utc>> {
     let val = val?;
-    if let Some(n) = val.as_f64() {
-        if n > 0.0 && n.is_finite() {
-            let ms = if n < 1e11 { (n * 1000.0) as i64 } else { n as i64 };
-            return DateTime::from_timestamp_millis(ms);
-        }
+    if let Some(n) = val.as_f64()
+        && n > 0.0
+        && n.is_finite()
+    {
+        let ms = if n < 1e11 {
+            (n * 1000.0) as i64
+        } else {
+            n as i64
+        };
+        return DateTime::from_timestamp_millis(ms);
     }
     if let Some(s) = val.as_str() {
         let t = s.trim();
         if t.is_empty() {
             return None;
         }
-        if let Ok(n) = t.parse::<f64>() {
-            if n > 0.0 && n.is_finite() {
-                let ms = if n < 1e11 { (n * 1000.0) as i64 } else { n as i64 };
-                return DateTime::from_timestamp_millis(ms);
-            }
+        if let Ok(n) = t.parse::<f64>()
+            && n > 0.0
+            && n.is_finite()
+        {
+            let ms = if n < 1e11 {
+                (n * 1000.0) as i64
+            } else {
+                n as i64
+            };
+            return DateTime::from_timestamp_millis(ms);
         }
         if let Ok(dt) = DateTime::parse_from_rfc3339(t) {
             return Some(dt.with_timezone(&Utc));
@@ -246,10 +256,10 @@ pub fn usage_from_profile(raw: &Value, auth: &AccountRecord) -> UsageReport {
     if let Some(w) = quota_window("Session", raw.get("session"), false) {
         windows.push(w);
     }
-    if let Some(w) = quota_window("Monthly overage", raw.get("overage_monthly"), true) {
-        if w.limit > 0.0 || w.amount > 0.0 || w.percent.unwrap_or(0.0) > 0.0 {
-            windows.push(w);
-        }
+    if let Some(w) = quota_window("Monthly overage", raw.get("overage_monthly"), true)
+        && (w.limit > 0.0 || w.amount > 0.0 || w.percent.unwrap_or(0.0) > 0.0)
+    {
+        windows.push(w);
     }
 
     UsageReport {
@@ -294,7 +304,11 @@ pub fn spent_allowance(raw: &Value) -> Option<SpentAllowance> {
         };
         if let Some(dt) = parse_iso_time(obj.get("resets_at")) {
             let diff = dt.timestamp_millis() - now_ms;
-            return if diff > 0 { ((diff + 999) / 1000) as u64 } else { 0 };
+            return if diff > 0 {
+                ((diff + 999) / 1000) as u64
+            } else {
+                0
+            };
         }
         obj.get("resume_in_minutes")
             .and_then(|v| v.as_f64())
@@ -323,7 +337,7 @@ pub fn spent_allowance(raw: &Value) -> Option<SpentAllowance> {
             secs: secs(raw.get("monthly")),
         });
     }
-    found.sort_by(|a, b| b.secs.cmp(&a.secs));
+    found.sort_by_key(|window| std::cmp::Reverse(window.secs));
     found.into_iter().next()
 }
 
@@ -344,16 +358,26 @@ fn settings_cache() -> &'static Mutex<HashMap<String, SettingsCacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub async fn account_settings(auth: &AccountRecord, cfg: &Settings) -> Result<Option<Value>, QbsError> {
+pub async fn account_settings(
+    auth: &AccountRecord,
+    cfg: &Settings,
+) -> Result<Option<Value>, QbsError> {
     let key = auth.key();
     {
         let cache = settings_cache().lock();
-        if let Some(hit) = cache.get(&key) {
-            if hit.at.elapsed() < Duration::from_secs(120) {
-                return Ok(Some(hit.value.clone()));
-            }
+        if let Some(hit) = cache.get(&key)
+            && hit.at.elapsed() < Duration::from_secs(120)
+        {
+            return Ok(Some(hit.value.clone()));
         }
     }
+    refresh_account_settings(auth, cfg).await
+}
+
+pub(crate) async fn refresh_account_settings(
+    auth: &AccountRecord,
+    cfg: &Settings,
+) -> Result<Option<Value>, QbsError> {
     let res = invoke(
         auth,
         cfg,
@@ -374,22 +398,36 @@ pub async fn account_settings(auth: &AccountRecord, cfg: &Settings) -> Result<Op
         })
         .or_else(|| res.get("payload"))
         .cloned();
-    if let Some(ref v) = value {
-        if v.is_object() {
-            let mut cache = settings_cache().lock();
-            if cache.len() > 32 {
-                cache.clear();
-            }
-            cache.insert(
-                key,
-                SettingsCacheEntry {
-                    at: Instant::now(),
-                    value: v.clone(),
-                },
-            );
+    if let Some(ref v) = value
+        && v.is_object()
+    {
+        let mut cache = settings_cache().lock();
+        if cache.len() > 32 {
+            cache.clear();
         }
+        cache.insert(
+            auth.key(),
+            SettingsCacheEntry {
+                at: Instant::now(),
+                value: v.clone(),
+            },
+        );
     }
     Ok(value)
+}
+
+pub(crate) fn remember_advanced_unavailable(auth: &AccountRecord) {
+    let key = auth.key();
+    let mut cache = settings_cache().lock();
+    if cache.len() > 32 && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    let entry = cache.entry(key).or_insert_with(|| SettingsCacheEntry {
+        at: Instant::now(),
+        value: json!({}),
+    });
+    entry.at = Instant::now();
+    entry.value["advanced_mode_enabled"] = json!(false);
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -451,7 +489,10 @@ pub async fn upload_attachment(
     let text = resp.text().await.unwrap_or_default();
     if !(200..300).contains(&status) {
         return Err(QbsError::new(
-            format!("Amazon Quick answered {status}: {}", text.chars().take(200).collect::<String>()),
+            format!(
+                "Amazon Quick answered {status}: {}",
+                text.chars().take(200).collect::<String>()
+            ),
             status,
         ));
     }
@@ -498,7 +539,9 @@ pub async fn upload_attachment(
                 if matches!(dstatus.as_str(), "COMPLETED" | "SKIPPED" | "NOT_APPLICABLE") {
                     if !action.is_empty() && action != "ALLOW" && action != "WARN" {
                         return Err(QbsError::new(
-                            format!("Amazon Quick's data protection policy blocked the attachment ({action})"),
+                            format!(
+                                "Amazon Quick's data protection policy blocked the attachment ({action})"
+                            ),
                             400,
                         ));
                     }

@@ -155,10 +155,7 @@ pub struct UserInfo {
 }
 
 pub fn normalize_user_info(raw: &Value) -> UserInfo {
-    let src = raw
-        .get("userInfo")
-        .filter(|v| v.is_object())
-        .unwrap_or(raw);
+    let src = raw.get("userInfo").filter(|v| v.is_object()).unwrap_or(raw);
     UserInfo {
         email: first_value(src, &["email", "emailAddress"]),
         user_name: first_value(src, &["userName", "user_name", "username"]),
@@ -209,12 +206,15 @@ fn tokens_from(raw: &Value) -> TokenBundle {
 pub fn build_http_client(cfg: &Settings) -> Client {
     let mut builder = Client::builder().timeout(Duration::from_secs(30));
     let proxy = cfg.proxy.trim();
-    if matches!(proxy.to_ascii_lowercase().as_str(), "direct" | "none" | "off") {
+    if matches!(
+        proxy.to_ascii_lowercase().as_str(),
+        "direct" | "none" | "off"
+    ) {
         builder = builder.no_proxy();
-    } else if !proxy.is_empty() {
-        if let Ok(p) = reqwest::Proxy::all(proxy) {
-            builder = builder.proxy(p);
-        }
+    } else if !proxy.is_empty()
+        && let Ok(p) = reqwest::Proxy::all(proxy)
+    {
+        builder = builder.proxy(p);
     }
     builder.build().unwrap_or_else(|_| Client::new())
 }
@@ -274,11 +274,15 @@ async fn fetch_user_info(
     cfg: &Settings,
 ) -> std::result::Result<UserInfo, OAuthError> {
     if tokens.access_token.is_empty() {
-        return Err(OAuthError::Other("token response has no access_token".into()));
+        return Err(OAuthError::Other(
+            "token response has no access_token".into(),
+        ));
     }
     let base = user_info_base(stage, tenant_url, cfg);
     if base.is_empty() {
-        return Err(OAuthError::Other("discovery response has no tenant_url".into()));
+        return Err(OAuthError::Other(
+            "discovery response has no tenant_url".into(),
+        ));
     }
     let url = format!("{base}/integration/quick-work/user-info");
     let raw = post_json(client, &url, &json!({}), Some(&tokens.access_token)).await?;
@@ -320,7 +324,10 @@ pub fn session_fields(
         None => parsed.host_str().unwrap_or("").to_string(),
     };
     if host_port.is_empty() {
-        return Err(anyhow!("cannot derive ws_host from tenant_url {:?}", tenant));
+        return Err(anyhow!(
+            "cannot derive ws_host from tenant_url {:?}",
+            tenant
+        ));
     }
 
     let claims = decode_jwt(&id_token).or_else(|| decode_jwt(&access));
@@ -478,9 +485,11 @@ pub async fn refresh_account(
 
     let raw = match res {
         Ok(v) => v,
-        Err(ref e @ OAuthError::Http { status, ref body, .. })
-            if status == 401 || (status == 400 && refused_re.is_match(body)) =>
-        {
+        Err(
+            ref e @ OAuthError::Http {
+                status, ref body, ..
+            },
+        ) if status == 401 || (status == 400 && refused_re.is_match(body)) => {
             return Err(OAuthError::Expired(format!(
                 "Amazon Quick refused the sign-in; sign in again ({e})"
             )));
@@ -586,11 +595,17 @@ impl LoginFlow {
             String::new()
         };
 
-        if !same_secret(query.get("nonce").map(|s| s.as_str()).unwrap_or(""), &self.nonce) {
+        if !same_secret(
+            query.get("nonce").map(|s| s.as_str()).unwrap_or(""),
+            &self.nonce,
+        ) {
             return Err(OAuthError::Step(400, "discovery nonce mismatch".into()));
         }
         if let Some(err) = query.get("error").filter(|s| !s.is_empty()) {
-            let desc = query.get("error_description").map(|s| s.as_str()).unwrap_or("");
+            let desc = query
+                .get("error_description")
+                .map(|s| s.as_str())
+                .unwrap_or("");
             return Err(OAuthError::Step(
                 400,
                 format!("login failed: {err} {desc}").trim().to_string(),
@@ -702,7 +717,10 @@ impl LoginFlow {
         cfg: &Settings,
     ) -> std::result::Result<AccountRecord, OAuthError> {
         if let Some(err) = query.get("error").filter(|s| !s.is_empty()) {
-            let desc = query.get("error_description").map(|s| s.as_str()).unwrap_or("");
+            let desc = query
+                .get("error_description")
+                .map(|s| s.as_str())
+                .unwrap_or("");
             return Err(OAuthError::Step(
                 400,
                 format!("login failed: {err} {desc}").trim().to_string(),
@@ -714,7 +732,10 @@ impl LoginFlow {
                 "the discovery step has not been completed yet".into(),
             ));
         }
-        if !same_secret(query.get("state").map(|s| s.as_str()).unwrap_or(""), &self.state) {
+        if !same_secret(
+            query.get("state").map(|s| s.as_str()).unwrap_or(""),
+            &self.state,
+        ) {
             return Err(OAuthError::Step(400, "OAuth state mismatch".into()));
         }
         let code = query
@@ -760,7 +781,6 @@ impl LoginFlow {
             device_id: String::new(),
             enabled: true,
         };
-        session_fields(&base, &tokens, &info, cfg)
-            .map_err(|e| OAuthError::Step(502, e.to_string()))
+        session_fields(&base, &tokens, &info, cfg).map_err(|e| OAuthError::Step(502, e.to_string()))
     }
 }

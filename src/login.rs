@@ -103,12 +103,13 @@ async fn handle_callback(
                 .into_response()
         }
         Err(e) => {
-            let status_code = StatusCode::from_u16(e.step_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status_code =
+                StatusCode::from_u16(e.step_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let msg = e.to_string();
-            if status_code != StatusCode::BAD_REQUEST || params.contains_key("error") {
-                if let Some(tx) = st.done.lock().await.take() {
-                    let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
-                }
+            if (status_code != StatusCode::BAD_REQUEST || params.contains_key("error"))
+                && let Some(tx) = st.done.lock().await.take()
+            {
+                let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
             }
             (
                 status_code,
@@ -136,7 +137,11 @@ async fn handle_root(
     if !has_code_or_err || !params.contains_key("state") {
         return (
             StatusCode::NOT_FOUND,
-            render_page(false, "Not found", "This address is not part of the sign-in."),
+            render_page(
+                false,
+                "Not found",
+                "This address is not part of the sign-in.",
+            ),
         )
             .into_response();
     }
@@ -188,12 +193,13 @@ async fn handle_root(
         }
         Err(e) => {
             *st.busy.lock().await = false;
-            let status_code = StatusCode::from_u16(e.step_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status_code =
+                StatusCode::from_u16(e.step_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let msg = e.to_string();
-            if status_code != StatusCode::BAD_REQUEST || params.contains_key("error") {
-                if let Some(tx) = st.done.lock().await.take() {
-                    let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
-                }
+            if (status_code != StatusCode::BAD_REQUEST || params.contains_key("error"))
+                && let Some(tx) = st.done.lock().await.take()
+            {
+                let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
             }
             (
                 status_code,
@@ -266,9 +272,7 @@ pub async fn start_browser_sign_in(cfg: &Settings) -> Result<BrowserSignInHandle
         }
     }
     let Some(listener) = listener else {
-        bail!(
-            "port {first} is busy; close what uses it or set callback_port, then sign in again"
-        );
+        bail!("port {first} is busy; close what uses it or set callback_port, then sign in again");
     };
     let port = listener.local_addr()?.port();
     let flow = LoginFlow::new(&cfg.stage, port, &cfg.app_version);

@@ -14,17 +14,21 @@ mod toasts;
 mod usage;
 mod view;
 
+use crate::config::BridgeConfig;
 use crate::gateway::ccswitch::detect_lan_ip;
 use crate::gateway::{RunningServer, start_server};
 use crate::login::start_browser_sign_in;
-use crate::pool::{AccountHealth, AccountPool, LogLevel, PoolSnapshot};
+use crate::pool::{
+    AccountHealth, AccountPool, AccountSnapshot, LogLevel, NoAvailableAccount, PoolSnapshot,
+};
+use crate::qbs::QuotaWindow;
 use crate::upstream::{TurnInput, UpstreamSession, chat};
 use anyhow::{Context as _, Result};
 use chrono::Utc;
 use gpui::{
     App, AppContext, Application, AssetSource, Bounds, ClipboardItem, Context, FocusHandle, Font,
     FontFallbacks, FontFeatures, ImageSource, ScrollHandle, SharedString, Timer, TitlebarOptions,
-    WindowAppearance, WindowBounds, WindowOptions, font, point, px, size,
+    Window, WindowAppearance, WindowBounds, WindowOptions, font, point, px, size,
 };
 use parking_lot::Mutex;
 use quota_history::{QuotaHistory, QuotaHistoryStore};
@@ -437,6 +441,8 @@ enum PendingAction {
 struct GuiShared {
     server_running: bool,
     gateway_busy: bool,
+    #[cfg(target_os = "macos")]
+    gateway_start_error: Option<(String, String)>,
     toasts: toasts::ToastQueue,
     sign_in: SignInState,
     sign_in_attempt: u64,
@@ -452,6 +458,15 @@ impl GuiShared {
         !self.server_running && !self.gateway_busy
     }
 
+    fn gateway_button_content(&self) -> (&'static str, &'static str) {
+        match (self.gateway_busy, self.server_running) {
+            (true, false) => ("icons/refresh-bold.svg", "正在启动"),
+            (true, true) => ("icons/refresh-bold.svg", "正在停止"),
+            (false, true) => ("icons/stop-bold.svg", "停止网关"),
+            (false, false) => ("icons/play-bold.svg", "启动网关"),
+        }
+    }
+
     fn queue_quota_batch(&mut self, snapshot: &PoolSnapshot) -> Vec<String> {
         if self.quota_loading_all {
             return Vec::new();
@@ -460,11 +475,8 @@ impl GuiShared {
             .accounts
             .iter()
             .filter(|account| account.enabled)
-            .filter_map(|account| {
-                self.quota_loading_keys
-                    .insert(account.key.clone())
-                    .then(|| account.key.clone())
-            })
+            .filter(|account| self.quota_loading_keys.insert(account.key.clone()))
+            .map(|account| account.key.clone())
             .collect();
         self.quota_loading_all = !keys.is_empty();
         keys
@@ -514,24 +526,43 @@ struct BridgeApp {
     log_sort: tables::NumberSort,
 }
 
+fn effective_dark_mode(config: &BridgeConfig, appearance: WindowAppearance) -> bool {
+    config
+        .options
+        .get("ui_dark_mode")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(matches!(
+            appearance,
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        ))
+}
+
 impl BridgeApp {
     fn new(
         rt: Arc<tokio::runtime::Runtime>,
         pool: Arc<AccountPool>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let snapshot = pool.snapshot();
-        let dark_mode = snapshot
-            .config
-            .options
-            .get("ui_dark_mode")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or_else(|| {
-                matches!(
-                    cx.window_appearance(),
-                    WindowAppearance::Dark | WindowAppearance::VibrantDark
-                )
-            });
+        let dark_mode = effective_dark_mode(&snapshot.config, window.appearance());
+        #[cfg(target_os = "windows")]
+        {
+            let darkness = f32::from(dark_mode);
+            desktop::sync_window_caption(
+                window,
+                darkness,
+                &components::Theme::interpolated(darkness),
+            );
+            cx.observe_window_appearance(window, |view, window, cx| {
+                let dark_mode = effective_dark_mode(&view.snapshot.config, window.appearance());
+                if dark_mode != view.dark_mode {
+                    view.transition_to_theme(dark_mode);
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
         let mut account_activity = HashMap::new();
         activity::observe_accounts(&mut account_activity, &snapshot.accounts, Utc::now());
         let quota_history = Arc::new(QuotaHistoryStore::load(
@@ -552,13 +583,10 @@ impl BridgeApp {
             let mut rx = pool.subscribe();
             let rev = ui_rev.clone();
             rt.spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            rev.fetch_add(1, Ordering::Release);
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
+                while let Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) =
+                    rx.recv().await
+                {
+                    rev.fetch_add(1, Ordering::Release);
                 }
             });
         }
@@ -623,11 +651,11 @@ impl BridgeApp {
                     }
                     let mut st = view.shared.lock();
                     dirty |= st.toasts.advance(now);
-                    if let Some((_, at)) = &st.copied_feedback {
-                        if at.elapsed() > Duration::from_millis(1500) {
-                            st.copied_feedback = None;
-                            dirty = true;
-                        }
+                    if let Some((_, at)) = &st.copied_feedback
+                        && at.elapsed() > Duration::from_millis(1500)
+                    {
+                        st.copied_feedback = None;
+                        dirty = true;
                     }
                     if second_elapsed {
                         let reduced = desktop::prefers_reduced_motion();
@@ -744,10 +772,14 @@ impl BridgeApp {
         }
     }
 
-    fn toggle_theme(&mut self) {
+    fn transition_to_theme(&mut self, dark_mode: bool) {
         let now = Instant::now();
         self.theme_transition = Some((now, self.theme_amount(now)));
-        self.dark_mode = !self.dark_mode;
+        self.dark_mode = dark_mode;
+    }
+
+    fn toggle_theme(&mut self) {
+        self.transition_to_theme(!self.dark_mode);
         self.set_option("ui_dark_mode", serde_json::Value::Bool(self.dark_mode));
     }
 
@@ -809,6 +841,10 @@ impl BridgeApp {
                 return;
             }
             st.gateway_busy = true;
+            #[cfg(target_os = "macos")]
+            {
+                st.gateway_start_error = None;
+            }
         }
         self.bump_ui();
         let cfg = self.pool.config();
@@ -846,6 +882,10 @@ impl BridgeApp {
                     {
                         let mut st = shared.lock();
                         st.gateway_busy = false;
+                        #[cfg(target_os = "macos")]
+                        {
+                            st.gateway_start_error = Some((title.clone(), detail.clone()));
+                        }
                         st.toasts.push(title, Some(detail), true, Instant::now());
                     }
                     rev.fetch_add(1, Ordering::Release);
@@ -897,6 +937,10 @@ impl BridgeApp {
             return;
         }
         self.snapshot.config = cfg;
+        #[cfg(target_os = "macos")]
+        {
+            self.shared.lock().gateway_start_error = None;
+        }
         if enable_lan {
             self.lan_ip = detect_lan_ip();
         } else {
@@ -918,6 +962,10 @@ impl BridgeApp {
             return;
         }
         self.snapshot.config = cfg;
+        #[cfg(target_os = "macos")]
+        {
+            self.shared.lock().gateway_start_error = None;
+        }
     }
 
     fn set_option(&mut self, key: &str, value: serde_json::Value) {
@@ -1128,9 +1176,12 @@ impl BridgeApp {
         let rev = self.ui_rev.clone();
         self.rt.spawn(async move {
             let outcome = async {
-                let picked = pool
-                    .pick_account("", &HashSet::new())
-                    .ok_or_else(|| anyhow::anyhow!("暂无可用账号"))?;
+                let (picked, request) = pool.reserve_request("", &HashSet::new(), None).map_err(
+                    |error| match error {
+                        NoAvailableAccount::Busy => anyhow::anyhow!("可用账号正忙，请稍后重试"),
+                        NoAvailableAccount::Unavailable => anyhow::anyhow!("暂无可用账号"),
+                    },
+                )?;
                 let key = picked.key();
                 let label = picked.display_label();
                 let auth = pool
@@ -1161,7 +1212,7 @@ impl BridgeApp {
                 } else {
                     res.usage.resolved_model_id.clone()
                 };
-                pool.record_probe_model(&key, &resolved);
+                request.finish(&resolved);
                 pool.push_log(crate::pool::RequestLogEntry {
                     timestamp: Utc::now(),
                     level: LogLevel::Info,
@@ -1213,6 +1264,28 @@ impl BridgeApp {
         let port = self.snapshot.config.port;
         let host = if lan { self.available_lan_ip() } else { None };
         format!("http://{}:{port}", host.unwrap_or("127.0.0.1"))
+    }
+
+    fn available_account_count(&self) -> usize {
+        self.snapshot
+            .accounts
+            .iter()
+            .filter(|account| account.enabled && matches!(account.health, AccountHealth::Healthy))
+            .count()
+    }
+
+    fn account_quota_windows<'a>(&'a self, account: &'a AccountSnapshot) -> &'a [QuotaWindow] {
+        self.visible_quota_history
+            .readings(&account.key)
+            .last()
+            .map(|reading| reading.windows.as_slice())
+            .or_else(|| {
+                account
+                    .quota
+                    .as_ref()
+                    .map(|report| report.windows.as_slice())
+            })
+            .unwrap_or_default()
     }
 
     fn lan_enabled(&self) -> bool {
@@ -1435,23 +1508,26 @@ pub fn run_gui() -> Result<()> {
                 None
             },
         };
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(920.0), px(620.0))),
-                titlebar: Some(titlebar),
-                ..Default::default()
-            },
-            move |window, cx| {
-                desktop::keep_window_in_background(window, cx);
-                cx.new(|cx| {
-                    let view = BridgeApp::new(rt_clone, pool_clone, cx);
-                    window.focus(&view.focus);
-                    view
-                })
-            },
-        )
-        .expect("failed to open GPUI window");
+        let _main_window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(920.0), px(620.0))),
+                    titlebar: Some(titlebar),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    desktop::keep_window_in_background(window, cx);
+                    cx.new(|cx| {
+                        let view = BridgeApp::new(rt_clone, pool_clone, window, cx);
+                        window.focus(&view.focus);
+                        view
+                    })
+                },
+            )
+            .expect("failed to open GPUI window");
+        #[cfg(target_os = "macos")]
+        desktop::set_main_window(cx, _main_window);
         cx.activate(true);
     });
     Ok(())
@@ -1460,6 +1536,24 @@ pub fn run_gui() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_theme_follows_system_until_the_user_chooses_one() {
+        let mut config = BridgeConfig::default();
+        for appearance in [WindowAppearance::Light, WindowAppearance::VibrantLight] {
+            assert!(!effective_dark_mode(&config, appearance));
+        }
+        for appearance in [WindowAppearance::Dark, WindowAppearance::VibrantDark] {
+            assert!(effective_dark_mode(&config, appearance));
+        }
+        for saved in [true, false] {
+            config.options.insert("ui_dark_mode".into(), saved.into());
+            let restored = serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            for appearance in [WindowAppearance::Light, WindowAppearance::Dark] {
+                assert_eq!(effective_dark_mode(&restored, appearance), saved);
+            }
+        }
+    }
 
     #[test]
     fn page_slide_follows_sidebar_order() {

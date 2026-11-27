@@ -1,12 +1,20 @@
+mod caption;
+pub(in crate::gui) use caption::sync_window_caption;
+
 use gpui::{App, Window};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
-    System::LibraryLoader::GetModuleHandleW,
+    Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
+    Graphics::Gdi::{COLOR_WINDOW, GetSysColor},
+    System::{
+        LibraryLoader::GetModuleHandleW,
+        Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
+    },
     UI::{
+        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
         Controls::{LIM_SMALL, LoadIconMetric},
         Shell::{
             DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
@@ -17,17 +25,20 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, IDI_APPLICATION,
             IsIconic, IsWindowVisible, LoadIconW, MF_SEPARATOR, MF_STRING, PostMessageW,
-            PostQuitMessage, RegisterWindowMessageW, SPI_GETCLIENTAREAANIMATION, SW_HIDE,
-            SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow, SystemParametersInfoW,
-            TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_APP, WM_CLOSE,
-            WM_CONTEXTMENU, WM_LBUTTONUP, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP,
+            PostQuitMessage, RegisterWindowMessageW, SPI_GETCLIENTAREAANIMATION,
+            SPI_GETHIGHCONTRAST, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+            SystemParametersInfoW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+            WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP,
+            WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
+            WM_THEMECHANGED,
         },
     },
 };
 use windows_sys::w;
 
 const ICON_ID: u32 = 1;
-const APP_ICON_RESOURCE: u16 = 1;
+const TRAY_ON_LIGHT_RESOURCE: u16 = 2;
+const TRAY_ON_DARK_RESOURCE: u16 = 3;
 const TRAY_SUBCLASS_ID: usize = 1;
 const TRAY_CALLBACK: u32 = WM_APP + 0x51;
 const OPEN_PANEL: usize = 1;
@@ -41,24 +52,23 @@ pub(in crate::gui) fn prefers_reduced_motion() -> bool {
     let mut enabled: i32 = 1;
     // SAFETY: 传入有效栈指针查询系统“客户端区域动画”开关。
     let ok = unsafe {
-        SystemParametersInfoW(
-            SPI_GETCLIENTAREAANIMATION,
-            0,
-            (&raw mut enabled).cast(),
-            0,
-        )
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut enabled).cast(), 0)
     };
     ok != 0 && enabled == 0
 }
 
-pub(in crate::gui) fn keep_window_in_background(window: &Window, cx: &App) {
-    let Ok(handle) = HasWindowHandle::window_handle(window) else {
-        return;
-    };
+fn native_window(window: &Window) -> Option<HWND> {
+    let handle = HasWindowHandle::window_handle(window).ok()?;
     let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return None;
+    };
+    Some(handle.hwnd.get() as HWND)
+}
+
+pub(in crate::gui) fn keep_window_in_background(window: &Window, cx: &App) {
+    let Some(hwnd) = native_window(window) else {
         return;
     };
-    let hwnd = handle.hwnd.get() as HWND;
 
     // 窗口已由 GPUI 在当前线程创建，托盘事件沿用同一个消息循环。
     TASKBAR_CREATED.get_or_init(|| unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) });
@@ -81,6 +91,80 @@ fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
     }
 }
 
+fn high_contrast_enabled() -> bool {
+    let mut contrast = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: 传给系统的缓冲区大小与 HIGHCONTRASTW 一致。
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            contrast.cbSize,
+            (&raw mut contrast).cast(),
+            0,
+        ) != 0
+            && contrast.dwFlags & HCF_HIGHCONTRASTON != 0
+    }
+}
+
+fn taskbar_is_light() -> bool {
+    let mut light: u32 = 0;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: 注册表查询写入上述 DWORD 缓冲区。
+    unsafe {
+        if high_contrast_enabled() {
+            let [red, green, blue, _] = GetSysColor(COLOR_WINDOW).to_le_bytes();
+            return 299 * u32::from(red) + 587 * u32::from(green) + 114 * u32::from(blue)
+                >= 128_000;
+        }
+        // 任务栏可以单独设置深浅色。旧版 Windows 的深色任务栏可能没有此键。
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            (&raw mut light).cast(),
+            &mut size,
+        ) == ERROR_SUCCESS
+            && light != 0
+    }
+}
+
+fn notify_tray(mut info: NOTIFYICONDATAW, add: bool) -> bool {
+    let resource = if taskbar_is_light() {
+        TRAY_ON_LIGHT_RESOURCE
+    } else {
+        TRAY_ON_DARK_RESOURCE
+    };
+    // SAFETY: Shell 复制图标。仅释放 LoadIconMetric 创建的句柄。
+    unsafe {
+        let mut icon = null_mut();
+        let own_icon = LoadIconMetric(
+            GetModuleHandleW(null()),
+            usize::from(resource) as *const u16,
+            LIM_SMALL,
+            &mut icon,
+        ) >= 0
+            && !icon.is_null();
+        info.hIcon = if own_icon {
+            icon
+        } else if add {
+            LoadIconW(null_mut(), IDI_APPLICATION)
+        } else {
+            return false;
+        };
+        let ok = !info.hIcon.is_null()
+            && ((add && Shell_NotifyIconW(NIM_ADD, &info) != 0)
+                || Shell_NotifyIconW(NIM_MODIFY, &info) != 0);
+        if own_icon {
+            DestroyIcon(icon);
+        }
+        ok
+    }
+}
+
 fn register_tray(hwnd: HWND) -> bool {
     let mut info = icon_data(hwnd);
     info.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
@@ -88,29 +172,9 @@ fn register_tray(hwnd: HWND) -> bool {
     for (slot, unit) in info.szTip.iter_mut().zip("Quick Bridge".encode_utf16()) {
         *slot = unit;
     }
-
-    // SAFETY: Win32 在调用期间读取结构体。LoadIconMetric 返回的图标由本函数释放。
+    // SAFETY: Win32 在调用期间读取窗口和图标标识。
     let version = unsafe {
-        let mut icon = null_mut();
-        let own_icon = LoadIconMetric(
-            GetModuleHandleW(null()),
-            usize::from(APP_ICON_RESOURCE) as *const u16,
-            LIM_SMALL,
-            &mut icon,
-        ) >= 0
-            && !icon.is_null();
-        info.hIcon = if own_icon {
-            icon
-        } else {
-            LoadIconW(null_mut(), IDI_APPLICATION)
-        };
-        let registered = !info.hIcon.is_null()
-            && (Shell_NotifyIconW(NIM_ADD, &info) != 0
-                || Shell_NotifyIconW(NIM_MODIFY, &info) != 0);
-        if own_icon {
-            DestroyIcon(icon);
-        }
-        if registered {
+        if notify_tray(info, true) {
             let mut version_info = icon_data(hwnd);
             version_info.Anonymous.uVersion = NOTIFYICON_VERSION_4;
             if Shell_NotifyIconW(NIM_SETVERSION, &version_info) != 0 {
@@ -223,12 +287,21 @@ unsafe extern "system" fn tray_window_proc(
             }
             return 0;
         }
+        WM_SETTINGCHANGE | WM_THEMECHANGED | WM_SYSCOLORCHANGE | WM_DPICHANGED
+        | WM_DISPLAYCHANGE
+            if version != 0 =>
+        {
+            let mut info = icon_data(hwnd);
+            info.uFlags = NIF_ICON;
+            notify_tray(info, false);
+        }
         WM_NCDESTROY => uninstall_tray(hwnd),
         _ if TASKBAR_CREATED
             .get()
             .is_some_and(|created| *created != 0 && message == *created) =>
         {
-            if !register_tray(hwnd) && unsafe { IsWindowVisible(hwnd) } == 0 {
+            let registered = register_tray(hwnd);
+            if !registered && unsafe { IsWindowVisible(hwnd) } == 0 {
                 show_panel(hwnd);
             }
         }
@@ -242,11 +315,35 @@ unsafe extern "system" fn tray_window_proc(
 mod tests {
     use super::*;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, IsWindow, SW_SHOWNOACTIVATE, SendMessageW,
+        CreateWindowExW, DestroyWindow, IsWindow, SW_SHOWNOACTIVATE, SendMessageW, WINDOW_STYLE,
         WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
-    struct TestWindow(HWND);
+    pub(super) struct TestWindow(pub(super) HWND);
+
+    impl TestWindow {
+        pub(super) fn new(style: WINDOW_STYLE) -> Self {
+            // SAFETY: 使用系统窗口类在测试线程创建窗口，由 Drop 在同一线程销毁。
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    w!("STATIC"),
+                    w!("Quick Bridge test"),
+                    style,
+                    0,
+                    0,
+                    100,
+                    100,
+                    null_mut(),
+                    null_mut(),
+                    GetModuleHandleW(null()),
+                    null(),
+                )
+            };
+            assert!(!hwnd.is_null());
+            Self(hwnd)
+        }
+    }
 
     impl Drop for TestWindow {
         fn drop(&mut self) {
@@ -257,24 +354,10 @@ mod tests {
 
     #[test]
     fn tray_close_and_reopen_preserve_the_native_window() {
-        // SAFETY: 使用系统已有的窗口类，随后在同一线程发送窗口消息。
+        let window = TestWindow::new(WS_POPUP);
+        let hwnd = window.0;
+        // SAFETY: 在创建窗口的线程发送窗口消息。
         unsafe {
-            let hwnd = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                w!("STATIC"),
-                w!("Quick Bridge tray test"),
-                WS_POPUP,
-                0,
-                0,
-                100,
-                100,
-                null_mut(),
-                null_mut(),
-                GetModuleHandleW(null()),
-                null(),
-            );
-            assert!(!hwnd.is_null());
-            let _window = TestWindow(hwnd);
             // 模拟通知区已成功注册，窗口测试可在无 Explorer 的 CI 中执行。
             assert_ne!(
                 SetWindowSubclass(hwnd, Some(tray_window_proc), TRAY_SUBCLASS_ID, TRAY_V4),

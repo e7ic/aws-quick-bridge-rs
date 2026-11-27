@@ -17,12 +17,14 @@ fn make_id(prefix: &str) -> String {
 }
 
 pub fn error_response(status: u16, message: &str, code: &str) -> Response {
-    let err_type = if status == 401 {
-        "authentication_error"
-    } else if status < 500 {
-        "invalid_request_error"
-    } else {
-        "server_error"
+    let err_type = match status {
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        429 if code == "insufficient_quota" => "insufficient_quota",
+        429 => "rate_limit_error",
+        ..=499 => "invalid_request_error",
+        _ => "server_error",
     };
     let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
     (
@@ -36,6 +38,27 @@ pub fn error_response(status: u16, message: &str, code: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn error_responses_use_the_status_specific_types() {
+    for (status, code, expected) in [
+        (403, "upstream_forbidden", "permission_error"),
+        (404, "model_not_found", "not_found_error"),
+        (429, "rate_limit_exceeded", "rate_limit_error"),
+        (429, "insufficient_quota", "insufficient_quota"),
+        (529, "overloaded", "server_error"),
+    ] {
+        let response = error_response(status, "fixture error", code);
+        assert_eq!(response.status().as_u16(), status);
+        let bytes = axum::body::to_bytes(response.into_body(), 1_024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], expected);
+        assert_eq!(body["error"]["code"], code);
+    }
 }
 
 fn is_text_type(t: &str) -> bool {
@@ -148,7 +171,12 @@ fn convert_messages(input: Option<&Value>) -> Vec<Value> {
             "type": "function",
             "function": { "name": name, "arguments": args }
         });
-        if out.last().and_then(|m| m.get("role")).and_then(|v| v.as_str()) == Some("assistant") {
+        if out
+            .last()
+            .and_then(|m| m.get("role"))
+            .and_then(|v| v.as_str())
+            == Some("assistant")
+        {
             let last = out.last_mut().unwrap();
             if let Some(arr) = last.get_mut("tool_calls").and_then(|v| v.as_array_mut()) {
                 arr.push(entry);
@@ -167,11 +195,19 @@ fn convert_messages(input: Option<&Value>) -> Vec<Value> {
         let typ = obj
             .get("type")
             .and_then(|v| v.as_str())
-            .unwrap_or(if obj.contains_key("role") { "message" } else { "" });
+            .unwrap_or(if obj.contains_key("role") {
+                "message"
+            } else {
+                ""
+            });
         match typ {
             "message" => {
                 let raw_role = obj.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                let role = if raw_role == "developer" { "system" } else { raw_role };
+                let role = if raw_role == "developer" {
+                    "system"
+                } else {
+                    raw_role
+                };
                 if !matches!(role, "user" | "assistant" | "system") {
                     continue;
                 }
@@ -206,7 +242,11 @@ fn convert_messages(input: Option<&Value>) -> Vec<Value> {
                     .or_else(|| obj.get("id"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let name = obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let args = serde_json::to_string(&json!({
                     "input": obj.get("input").cloned().unwrap_or(json!(""))
                 }))
@@ -266,16 +306,17 @@ pub fn to_chat(body: &Value, headers: &HeaderMap) -> ResponsesRequest {
                     }
                 }
                 "namespace" => {
-                    if let Some(ns) = t.get("name").and_then(|v| v.as_str()) {
-                        if let Some(inners) = t.get("tools").and_then(|v| v.as_array()) {
-                            for inner in inners {
-                                if inner.get("type").and_then(|v| v.as_str()) != Some("function") {
-                                    continue;
-                                }
-                                if let Some(iname) = inner.get("name").and_then(|v| v.as_str()) {
-                                    let flat = flat_name(Some(ns), iname);
-                                    spaces.insert(flat.clone(), (ns.to_string(), iname.to_string()));
-                                    chat_tools.push(json!({
+                    if let Some(ns) = t.get("name").and_then(|v| v.as_str())
+                        && let Some(inners) = t.get("tools").and_then(|v| v.as_array())
+                    {
+                        for inner in inners {
+                            if inner.get("type").and_then(|v| v.as_str()) != Some("function") {
+                                continue;
+                            }
+                            if let Some(iname) = inner.get("name").and_then(|v| v.as_str()) {
+                                let flat = flat_name(Some(ns), iname);
+                                spaces.insert(flat.clone(), (ns.to_string(), iname.to_string()));
+                                chat_tools.push(json!({
                                         "type": "function",
                                         "function": {
                                             "name": flat,
@@ -283,7 +324,6 @@ pub fn to_chat(body: &Value, headers: &HeaderMap) -> ResponsesRequest {
                                             "parameters": inner.get("parameters").cloned().unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
                                         }
                                     }));
-                                }
                             }
                         }
                     }
@@ -349,10 +389,10 @@ pub fn to_chat(body: &Value, headers: &HeaderMap) -> ResponsesRequest {
     }
 
     let mut msgs = Vec::new();
-    if let Some(inst) = body.get("instructions").and_then(|v| v.as_str()) {
-        if !inst.trim().is_empty() {
-            msgs.push(json!({ "role": "system", "content": inst }));
-        }
+    if let Some(inst) = body.get("instructions").and_then(|v| v.as_str())
+        && !inst.trim().is_empty()
+    {
+        msgs.push(json!({ "role": "system", "content": inst }));
     }
     msgs.extend(convert_messages(body.get("input")));
 
@@ -370,7 +410,8 @@ pub fn to_chat(body: &Value, headers: &HeaderMap) -> ResponsesRequest {
             Value::String(s) if s == "none" || s == "required" => chat["tool_choice"] = json!(s),
             Value::Object(o) => {
                 if let Some(name) = o.get("name").and_then(|v| v.as_str()) {
-                    chat["tool_choice"] = json!({ "type": "function", "function": { "name": name } });
+                    chat["tool_choice"] =
+                        json!({ "type": "function", "function": { "name": name } });
                 }
             }
             _ => {}
@@ -568,36 +609,39 @@ pub fn from_chat_output(
                 }
                 let mut open: Option<OpenItem> = None;
 
-                let close_item = |open: &mut Option<OpenItem>, items: &mut Vec<Value>, send: &mut dyn FnMut(&str, Value)| {
-                    let Some(cur) = open.take() else { return };
-                    let output_index = items.len();
-                    let finished = if cur.kind == "reasoning" {
+                let close_item =
+                    |open: &mut Option<OpenItem>,
+                     items: &mut Vec<Value>,
+                     send: &mut dyn FnMut(&str, Value)| {
+                        let Some(cur) = open.take() else { return };
+                        let output_index = items.len();
+                        let finished = if cur.kind == "reasoning" {
+                            send(
+                                "response.reasoning_summary_text.done",
+                                json!({ "item_id": cur.id, "output_index": output_index, "summary_index": 0, "text": cur.text }),
+                            );
+                            send(
+                                "response.reasoning_summary_part.done",
+                                json!({ "item_id": cur.id, "output_index": output_index, "summary_index": 0, "part": { "type": "summary_text", "text": cur.text } }),
+                            );
+                            reasoning_item(cur.id, &cur.text)
+                        } else {
+                            send(
+                                "response.output_text.done",
+                                json!({ "item_id": cur.id, "output_index": output_index, "content_index": 0, "text": cur.text, "logprobs": [] }),
+                            );
+                            send(
+                                "response.content_part.done",
+                                json!({ "item_id": cur.id, "output_index": output_index, "content_index": 0, "part": { "type": "output_text", "text": cur.text, "annotations": [] } }),
+                            );
+                            message_item(cur.id, &cur.text)
+                        };
                         send(
-                            "response.reasoning_summary_text.done",
-                            json!({ "item_id": cur.id, "output_index": output_index, "summary_index": 0, "text": cur.text }),
+                            "response.output_item.done",
+                            json!({ "output_index": output_index, "item": finished }),
                         );
-                        send(
-                            "response.reasoning_summary_part.done",
-                            json!({ "item_id": cur.id, "output_index": output_index, "summary_index": 0, "part": { "type": "summary_text", "text": cur.text } }),
-                        );
-                        reasoning_item(cur.id, &cur.text)
-                    } else {
-                        send(
-                            "response.output_text.done",
-                            json!({ "item_id": cur.id, "output_index": output_index, "content_index": 0, "text": cur.text, "logprobs": [] }),
-                        );
-                        send(
-                            "response.content_part.done",
-                            json!({ "item_id": cur.id, "output_index": output_index, "content_index": 0, "part": { "type": "output_text", "text": cur.text, "annotations": [] } }),
-                        );
-                        message_item(cur.id, &cur.text)
+                        items.push(finished);
                     };
-                    send(
-                        "response.output_item.done",
-                        json!({ "output_index": output_index, "item": finished }),
-                    );
-                    items.push(finished);
-                };
 
                 let outcome = loop {
                     let Some(ev) = started.rx.recv().await else {

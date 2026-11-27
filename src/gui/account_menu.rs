@@ -33,16 +33,16 @@ enum AccountAction {
 
 impl BridgeApp {
     fn dismiss_account_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(menu) = self.account_menu.as_mut() {
-            if menu.closing.is_none() {
-                menu.closing = Some(Instant::now());
-                if let Some(trigger) = menu.trigger_focus.take() {
-                    window.focus(&trigger);
-                } else {
-                    window.blur();
-                }
-                cx.notify();
+        if let Some(menu) = self.account_menu.as_mut()
+            && menu.closing.is_none()
+        {
+            menu.closing = Some(Instant::now());
+            if let Some(trigger) = menu.trigger_focus.take() {
+                window.focus(&trigger);
+            } else {
+                window.blur();
             }
+            cx.notify();
         }
     }
 

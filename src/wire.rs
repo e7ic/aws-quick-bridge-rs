@@ -156,8 +156,9 @@ pub fn event_stream_decode_all(buf: &[u8]) -> Result<(Vec<EventStreamMessage>, u
     let mut messages = Vec::new();
     let mut pos = 0usize;
     while pos + 16 <= buf.len() {
-        let total = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
-        if total < 16 || total > 16 * 1024 * 1024 {
+        let total =
+            u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+        if !(16..=16 * 1024 * 1024).contains(&total) {
             bail!("invalid event-stream frame length {total}");
         }
         if pos + total > buf.len() {
@@ -179,7 +180,10 @@ pub fn event_stream_decode_all(buf: &[u8]) -> Result<(Vec<EventStreamMessage>, u
 }
 
 fn header_string(headers: &HashMap<String, HeaderValue>, key: &str) -> String {
-    headers.get(key).and_then(|v| v.as_str()).unwrap_or_default()
+    headers
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
 }
 
 fn frame_error(headers: &HashMap<String, HeaderValue>) -> Option<anyhow::Error> {
@@ -237,8 +241,8 @@ pub fn aidp_decode(bytes: &[u8]) -> Result<Vec<String>> {
         if let Some(err) = frame_error(&msg.headers) {
             return Err(err);
         }
-        let outer: Value = serde_json::from_slice(&msg.payload)
-            .map_err(|e| anyhow!("decode AIDP body: {e}"))?;
+        let outer: Value =
+            serde_json::from_slice(&msg.payload).map_err(|e| anyhow!("decode AIDP body: {e}"))?;
         let b64 = outer
             .get("payload")
             .and_then(|v| v.as_str())

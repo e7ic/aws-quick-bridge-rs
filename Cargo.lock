@@ -533,11 +533,12 @@ dependencies = [
 
 [[package]]
 name = "aws-quick-bridge-rs"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.23.1",
+ "block2",
  "bytes",
  "chrono",
  "clap",
@@ -549,6 +550,7 @@ dependencies = [
  "gpui",
  "hex",
  "http",
+ "image",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -558,6 +560,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "reqwest",
+ "resvg",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -3824,6 +3827,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d49e936b501e5c5bf01fda3a9452ff86dc3ea98ad5f283e1455153142d97518c"
 dependencies = [
  "bitflags 2.13.2",
+ "block2",
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",

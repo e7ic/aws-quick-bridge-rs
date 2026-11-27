@@ -94,8 +94,14 @@ pub fn tool_definitions(tools: Option<&[Value]>, functions: Option<&[Value]>) ->
 }
 
 pub fn requested_tool_names(body: &Value) -> HashSet<String> {
-    let tools = body.get("tools").and_then(|v| v.as_array()).map(|v| v.as_slice());
-    let funcs = body.get("functions").and_then(|v| v.as_array()).map(|v| v.as_slice());
+    let tools = body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|v| v.as_slice());
+    let funcs = body
+        .get("functions")
+        .and_then(|v| v.as_array())
+        .map(|v| v.as_slice());
     tool_definitions(tools, funcs)
         .into_iter()
         .map(|d| d.name.trim().to_string())
@@ -182,7 +188,11 @@ fn type_of(schema: Option<&Value>) -> String {
         let fields: Vec<String> = props
             .iter()
             .map(|(k, v)| {
-                let star = if required.contains(k.as_str()) { "*" } else { "" };
+                let star = if required.contains(k.as_str()) {
+                    "*"
+                } else {
+                    ""
+                };
                 format!("{k}{star}: {}", type_of(Some(v)))
             })
             .collect();
@@ -209,7 +219,11 @@ fn signature(def: &ToolDef, about: usize) -> String {
             props
                 .iter()
                 .map(|(k, v)| {
-                    let star = if required.contains(k.as_str()) { "*" } else { "" };
+                    let star = if required.contains(k.as_str()) {
+                        "*"
+                    } else {
+                        ""
+                    };
                     format!("{k}{star}: {}", type_of(Some(v)))
                 })
                 .collect()
@@ -505,12 +519,12 @@ fn is_real_value_string_end(chars: &[char], pos: usize, stack: &[JsonContainer])
 /// 3. 去除对象/数组末尾的多余逗号。
 fn repair_json_payload(raw: &str) -> String {
     let mut text = raw.trim();
-    if text.starts_with("```") {
-        if let Some(nl) = text.find('\n') {
-            text = text[nl + 1..].trim();
-            if let Some(stripped) = text.strip_suffix("```") {
-                text = stripped.trim();
-            }
+    if text.starts_with("```")
+        && let Some(nl) = text.find('\n')
+    {
+        text = text[nl + 1..].trim();
+        if let Some(stripped) = text.strip_suffix("```") {
+            text = stripped.trim();
         }
     }
 
@@ -673,10 +687,10 @@ fn parse_envelopes(payload: &str) -> Vec<Value> {
     match val {
         Value::Array(arr) => arr,
         Value::Object(ref obj) => {
-            if let Some(Value::Array(tcs)) = obj.get("tool_calls") {
-                if !tcs.is_empty() {
-                    return tcs.clone();
-                }
+            if let Some(Value::Array(tcs)) = obj.get("tool_calls")
+                && !tcs.is_empty()
+            {
+                return tcs.clone();
             }
             vec![val]
         }
@@ -768,12 +782,12 @@ fn extract_bare_tool_call(text: &str, allowed: &HashSet<String>) -> Option<Vec<T
         return None;
     }
     let mut trimmed = text.trim();
-    if trimmed.starts_with("```") {
-        if let Some(nl) = trimmed.find('\n') {
-            trimmed = trimmed[nl + 1..].trim();
-            if let Some(stripped) = trimmed.strip_suffix("```") {
-                trimmed = stripped.trim();
-            }
+    if trimmed.starts_with("```")
+        && let Some(nl) = trimmed.find('\n')
+    {
+        trimmed = trimmed[nl + 1..].trim();
+        if let Some(stripped) = trimmed.strip_suffix("```") {
+            trimmed = stripped.trim();
         }
     }
     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
@@ -1010,7 +1024,10 @@ mod tests {
     fn test_bare_json_call() {
         let allowed: HashSet<String> = ["bash"].into_iter().map(String::from).collect();
         let mut s = BridgeStream::new(allowed);
-        assert!(s.push("```json\n{\"name\":\"bash\",\"arguments\":{\"cmd\":\"ls\"}}\n```").is_none());
+        assert!(
+            s.push("```json\n{\"name\":\"bash\",\"arguments\":{\"cmd\":\"ls\"}}\n```")
+                .is_none()
+        );
         let (tail, calls) = s.finish().unwrap();
         assert!(tail.is_none());
         assert_eq!(calls.len(), 1);
@@ -1026,9 +1043,22 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Bash");
         let parsed: Value = serde_json::from_str(&calls[0].arguments).unwrap();
-        assert!(parsed["command"].as_str().unwrap().contains(r#"rm "$d/.codex-worktree-name""#));
-        assert!(parsed["command"].as_str().unwrap().contains(r#"echo "已删除 $d""#));
-        assert_eq!(parsed["description"], "删除两个只剩空标记文件的 codex 残留目录，并复核结果");
+        assert!(
+            parsed["command"]
+                .as_str()
+                .unwrap()
+                .contains(r#"rm "$d/.codex-worktree-name""#)
+        );
+        assert!(
+            parsed["command"]
+                .as_str()
+                .unwrap()
+                .contains(r#"echo "已删除 $d""#)
+        );
+        assert_eq!(
+            parsed["description"],
+            "删除两个只剩空标记文件的 codex 残留目录，并复核结果"
+        );
     }
 
     #[test]
@@ -1043,8 +1073,18 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "Bash");
         let parsed: Value = serde_json::from_str(&calls[0].arguments).unwrap();
-        assert!(parsed["command"].as_str().unwrap().contains(r#"if [ -e "$d" ];"#));
-        assert!(parsed["command"].as_str().unwrap().contains(r#"ls -la "$(git rev-parse --git-common-dir)/worktrees" 2>&1"#));
+        assert!(
+            parsed["command"]
+                .as_str()
+                .unwrap()
+                .contains(r#"if [ -e "$d" ];"#)
+        );
+        assert!(
+            parsed["command"]
+                .as_str()
+                .unwrap()
+                .contains(r#"ls -la "$(git rev-parse --git-common-dir)/worktrees" 2>&1"#)
+        );
     }
 
     #[test]

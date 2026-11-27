@@ -60,8 +60,8 @@ pub(super) struct Theme {
     pub(super) bg_seg_active: Hsla,
     pub(super) bg_skeleton: Hsla,
     skeleton_highlight: Hsla,
-    gateway_idle_glow: [Hsla; 2],
-    gateway_running_glow: [Hsla; 2],
+    pub(super) gateway_idle_glow: [Hsla; 2],
+    pub(super) gateway_running_glow: [Hsla; 2],
     pub(super) border_subtle: Hsla,
     pub(super) border_strong: Hsla,
     pub(super) cta_bg: Hsla,
@@ -335,6 +335,29 @@ impl QuotaTrendPoint {
         }
     }
 
+    pub(super) fn history(
+        quota: &QuotaWindow,
+        history: &[QuotaReading],
+        updated_at: Option<DateTime<Utc>>,
+    ) -> Vec<Self> {
+        let mut points: Vec<_> = history
+            .iter()
+            .rev()
+            .map_while(|reading| {
+                reading
+                    .windows
+                    .iter()
+                    .find(|item| item.name == quota.name)
+                    .map(|item| Self::from_window(item, Some(reading.at)))
+            })
+            .collect();
+        points.reverse();
+        if points.is_empty() {
+            points.push(Self::from_window(quota, updated_at));
+        }
+        points
+    }
+
     pub(super) fn tooltip(self) -> String {
         let time = self.at.map_or_else(
             || "—".to_owned(),
@@ -557,15 +580,19 @@ impl BridgeApp {
     }
 
     /// 带可选 Solar Bold 图标的 Loopo 触感按钮。
-    pub(super) fn button(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Shared GPUI button entry point with separate presentation and event options"
+    )]
+    pub(super) fn button<V: 'static>(
         t: Theme,
         id: impl Into<SharedString>,
         icon_path: Option<&'static str>,
         loading: bool,
         label: impl Into<SharedString>,
         variant: BtnVariant,
-        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+        cx: &mut Context<V>,
     ) -> AnyElement {
         let id: SharedString = id.into();
         let spin_id = format!("btn-spin-{id}");
@@ -595,15 +622,19 @@ impl BridgeApp {
         )
     }
 
-    pub(super) fn button_with_content<C: IntoIterator<Item = AnyElement>>(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Custom button content uses the same presentation and event options"
+    )]
+    pub(super) fn button_with_content<V: 'static, C: IntoIterator<Item = AnyElement>>(
         t: Theme,
         id: impl Into<SharedString>,
         loading: bool,
         has_label: bool,
         variant: BtnVariant,
         content: impl FnOnce(Hsla) -> C,
-        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
-        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+        cx: &mut Context<V>,
     ) -> AnyElement {
         let id_ss: SharedString = id.into();
         let primary_start: Hsla = rgb(0x1456d9).into();
@@ -1368,21 +1399,7 @@ impl BridgeApp {
             ));
         }
 
-        let mut trend: Vec<_> = history
-            .iter()
-            .rev()
-            .map_while(|reading| {
-                reading
-                    .windows
-                    .iter()
-                    .find(|item| item.name == quota.name)
-                    .map(|item| QuotaTrendPoint::from_window(item, Some(reading.at)))
-            })
-            .collect();
-        trend.reverse();
-        if trend.is_empty() {
-            trend.push(QuotaTrendPoint::from_window(quota, updated_at));
-        }
+        let trend = QuotaTrendPoint::history(quota, history, updated_at);
         tooltip.push_str(&format!(" · 剩余比例 · 最近 {} 次成功刷新", trend.len()));
         if let Some(latest) = history.last() {
             tooltip.push_str(&format!(
@@ -1405,7 +1422,7 @@ impl BridgeApp {
     }
 }
 
-fn quota_dots(t: Theme, remaining: f64, color: Hsla) -> impl IntoElement {
+pub(super) fn quota_dots(t: Theme, remaining: f64, color: Hsla) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, (), window, _| {
@@ -1441,7 +1458,7 @@ fn quota_remaining_ratio(quota: &QuotaWindow) -> f64 {
     (1.0 - used).clamp(0.0, 1.0)
 }
 
-fn quota_remaining(quota: &QuotaWindow) -> (f64, Option<f64>) {
+pub(super) fn quota_remaining(quota: &QuotaWindow) -> (f64, Option<f64>) {
     (quota_remaining_ratio(quota), quota_credits(quota))
 }
 
@@ -1449,7 +1466,7 @@ fn quota_credits(quota: &QuotaWindow) -> Option<f64> {
     (quota.limit > 0.0).then(|| (quota.limit - quota.amount).clamp(0.0, quota.limit))
 }
 
-fn format_quota_credits(balance: f64) -> String {
+pub(super) fn format_quota_credits(balance: f64) -> String {
     if balance > 0.0 && balance < 0.01 {
         "<0.01".to_owned()
     } else {
@@ -1460,7 +1477,7 @@ fn format_quota_credits(balance: f64) -> String {
     }
 }
 
-fn quota_percent(remaining: f64) -> String {
+pub(super) fn quota_percent(remaining: f64) -> String {
     if remaining > 0.0 && remaining < 0.01 {
         "<1%".to_owned()
     } else {

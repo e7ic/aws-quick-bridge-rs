@@ -15,7 +15,9 @@ const HEADER_BYTES: usize = MAGIC.len() + 16;
 const SAMPLE_BYTES: usize = 33;
 const MAX_FILE_BYTES: usize = HEADER_BYTES + MAX_LOG_ENTRIES * SAMPLE_BYTES;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) enum RequestProtocol {
     Messages = 0,
     Responses = 1,

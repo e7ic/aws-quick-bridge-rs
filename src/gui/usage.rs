@@ -600,16 +600,16 @@ impl BridgeApp {
     }
 
     fn dismiss_usage_dropdown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(dropdown) = self.usage.dropdown.as_mut() {
-            if dropdown.closing.is_none() {
-                dropdown.closing = Some(Instant::now());
-                if let Some(trigger) = dropdown.trigger_focus.take() {
-                    window.focus(&trigger);
-                } else {
-                    window.blur();
-                }
-                cx.notify();
+        if let Some(dropdown) = self.usage.dropdown.as_mut()
+            && dropdown.closing.is_none()
+        {
+            dropdown.closing = Some(Instant::now());
+            if let Some(trigger) = dropdown.trigger_focus.take() {
+                window.focus(&trigger);
+            } else {
+                window.blur();
             }
+            cx.notify();
         }
     }
 

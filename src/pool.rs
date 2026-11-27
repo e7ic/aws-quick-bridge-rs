@@ -25,30 +25,30 @@ use parking_lot::{Mutex, RwLock};
 pub(crate) use request_stats::RequestProtocol;
 pub(crate) use request_stats::RequestSample;
 use request_stats::{RequestStatsStore, StatsUpdate};
-#[cfg(feature = "gui")]
-pub(crate) use usage_stats::{
-    ContextSample, USAGE_RETENTION_DAYS, UsageBucket, UsageHistory, UsageTotals,
-};
-use usage_stats::UsageStore;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
+use usage_stats::UsageStore;
+#[cfg(feature = "gui")]
+pub(crate) use usage_stats::{
+    ContextSample, USAGE_RETENTION_DAYS, UsageBucket, UsageHistory, UsageTotals,
+};
 
 const MAX_LOG_ENTRIES: usize = 300;
 const DEFAULT_COOLDOWN_SECS: u64 = 120;
+const MAX_SESSION_BINDINGS: usize = 1_000;
+const SESSION_BINDING_TTL: Duration = Duration::from_secs(6 * 3600);
+pub(crate) const PREFERRED_SLOT_WAIT: Duration = Duration::from_millis(500);
+pub(crate) const BUSY_SLOT_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AccountHealth {
     Healthy,
-    CoolingDown {
-        until_epoch_ms: i64,
-        reason: String,
-    },
-    Expired {
-        reason: String,
-    },
+    CoolingDown { until_epoch_ms: i64, reason: String },
+    Expired { reason: String },
     Disabled,
 }
 
@@ -56,7 +56,6 @@ pub enum AccountHealth {
 pub struct AccountRuntime {
     pub record: AccountRecord,
     pub health: AccountHealth,
-    pub active_requests: usize,
     pub total_requests: u64,
     last_used_at: Option<Instant>,
     pub last_resolved_model: Option<String>,
@@ -118,11 +117,17 @@ pub struct PoolSnapshot {
     pub last_resolved_model: Option<String>,
 }
 
+struct AccountsState {
+    records: Vec<AccountRuntime>,
+    // Keep slots owned by their requests across credential refreshes and account reloads.
+    in_flight: HashMap<String, usize>,
+    rr_cursor: usize,
+}
+
 pub struct AccountPool {
     config: RwLock<BridgeConfig>,
     primary_key: RwLock<String>,
-    accounts: RwLock<Vec<AccountRuntime>>,
-    rr_cursor: Mutex<usize>,
+    accounts: RwLock<AccountsState>,
     session_affinity: Mutex<HashMap<String, (String, Instant)>>,
     refresh_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub threads: Arc<Mutex<ThreadStore>>,
@@ -133,19 +138,56 @@ pub struct AccountPool {
     changes_tx: broadcast::Sender<()>,
 }
 
+#[derive(Debug)]
+pub(crate) enum NoAvailableAccount {
+    Busy,
+    Unavailable,
+}
+
+enum AccountSelectionError {
+    PreferredBusy,
+    NoAccount(NoAvailableAccount),
+}
+
+impl From<AccountSelectionError> for NoAvailableAccount {
+    fn from(error: AccountSelectionError) -> Self {
+        match error {
+            AccountSelectionError::PreferredBusy => Self::Busy,
+            AccountSelectionError::NoAccount(reason) => reason,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AccountSelection {
+    Lookup,
+    Reserve,
+    WaitForPreferred,
+}
+
 pub(crate) struct ActiveRequest {
     pool: Arc<AccountPool>,
     account_key: Option<String>,
+    started: bool,
 }
 
 impl ActiveRequest {
+    pub(crate) fn start(&mut self) {
+        if let Some(key) = self.account_key.as_deref()
+            && !self.started
+        {
+            self.pool.record_request_start(key);
+            self.started = true;
+        }
+    }
+
     pub(crate) fn finish(mut self, resolved_model: &str) {
         self.complete(Some(resolved_model));
     }
 
     fn complete(&mut self, resolved_model: Option<&str>) {
         if let Some(key) = self.account_key.take() {
-            self.pool.end_request(&key, resolved_model);
+            self.pool.release_request(key, self.started, resolved_model);
         }
     }
 }
@@ -177,7 +219,6 @@ impl AccountPool {
                 AccountRuntime {
                     record: r,
                     health,
-                    active_requests: 0,
                     total_requests: 0,
                     last_used_at: None,
                     last_resolved_model: None,
@@ -190,8 +231,11 @@ impl AccountPool {
         Self {
             config: RwLock::new(cfg),
             primary_key: RwLock::new(accs.primary_key),
-            accounts: RwLock::new(runtimes),
-            rr_cursor: Mutex::new(0),
+            accounts: RwLock::new(AccountsState {
+                records: runtimes,
+                in_flight: HashMap::new(),
+                rr_cursor: 0,
+            }),
             session_affinity: Mutex::new(HashMap::new()),
             refresh_locks: Mutex::new(HashMap::new()),
             threads: Arc::new(Mutex::new(ThreadStore::load(
@@ -221,6 +265,15 @@ impl AccountPool {
         Settings::from_options(&self.config.read().options)
     }
 
+    pub(crate) fn enabled_account_count(&self) -> usize {
+        self.accounts
+            .read()
+            .records
+            .iter()
+            .filter(|account| account.record.enabled)
+            .count()
+    }
+
     pub fn update_config(&self, cfg: BridgeConfig) -> Result<()> {
         save_config(&cfg)?;
         *self.config.write() = cfg;
@@ -237,15 +290,14 @@ impl AccountPool {
 
     pub(crate) fn reload_accounts_from_disk(&self) {
         let disk = load_accounts();
-        let mut accs = self.accounts.write();
-        let old_map: HashMap<String, AccountRuntime> = accs
-            .drain(..)
-            .map(|a| (a.record.key(), a))
-            .collect();
+        let accs = &mut self.accounts.write().records;
+        let old_map: HashMap<String, AccountRuntime> =
+            accs.drain(..).map(|a| (a.record.key(), a)).collect();
         for rec in disk.accounts {
             let key = rec.key();
             if let Some(mut prev) = old_map.get(&key).cloned() {
-                if rec.expires > prev.record.expires || rec.access != prev.record.access
+                if rec.expires > prev.record.expires
+                    || rec.access != prev.record.access
                     || rec.enabled != prev.record.enabled
                 {
                     prev.health = if rec.enabled {
@@ -268,7 +320,6 @@ impl AccountPool {
                 accs.push(AccountRuntime {
                     record: rec,
                     health,
-                    active_requests: 0,
                     total_requests: 0,
                     last_used_at: None,
                     last_resolved_model: None,
@@ -315,7 +366,7 @@ impl AccountPool {
         save_accounts(&file)?;
         {
             let mut accs = self.accounts.write();
-            if let Some(rt) = accs.iter_mut().find(|a| a.record.key() == key) {
+            if let Some(rt) = accs.records.iter_mut().find(|a| a.record.key() == key) {
                 rt.record.enabled = enabled;
                 rt.health = if enabled {
                     AccountHealth::Healthy
@@ -329,15 +380,14 @@ impl AccountPool {
     }
 
     fn apply_accounts_file(&self, file: AccountsFile) {
-        let mut accs = self.accounts.write();
-        let old: HashMap<String, AccountRuntime> = accs
-            .drain(..)
-            .map(|a| (a.record.key(), a))
-            .collect();
+        let accs = &mut self.accounts.write().records;
+        let old: HashMap<String, AccountRuntime> =
+            accs.drain(..).map(|a| (a.record.key(), a)).collect();
         for rec in file.accounts {
             let key = rec.key();
             if let Some(mut prev) = old.get(&key).cloned() {
-                let token_changed = prev.record.access != rec.access || prev.record.expires != rec.expires;
+                let token_changed =
+                    prev.record.access != rec.access || prev.record.expires != rec.expires;
                 prev.record = rec;
                 if !prev.record.enabled {
                     prev.health = AccountHealth::Disabled;
@@ -354,7 +404,6 @@ impl AccountPool {
                 accs.push(AccountRuntime {
                     record: rec,
                     health,
-                    active_requests: 0,
                     total_requests: 0,
                     last_used_at: None,
                     last_resolved_model: None,
@@ -444,111 +493,224 @@ impl AccountPool {
         self.usage_stats.snapshot()
     }
 
-    /// 选择下一个可用账号（优先会话亲和，其次空闲主账号或轮询负载均衡）。
-    pub fn pick_account(&self, conversation: &str, exclude: &HashSet<String>) -> Option<AccountRecord> {
-        self.pick_account_for_turn(conversation, exclude, None)
+    /// 查找可处理元数据等短操作的账号，对话使用 reserve_conversation 占用名额。
+    pub fn pick_account(
+        &self,
+        conversation: &str,
+        exclude: &HashSet<String>,
+    ) -> Option<AccountRecord> {
+        self.select_account(conversation, exclude, None, AccountSelection::Lookup)
+            .ok()
     }
 
-    pub(crate) fn pick_account_for_turn(
+    pub(crate) fn reserve_request(
+        self: &Arc<Self>,
+        conversation: &str,
+        exclude: &HashSet<String>,
+        thread_account: Option<&str>,
+    ) -> Result<(AccountRecord, ActiveRequest), NoAvailableAccount> {
+        self.try_reserve_request(
+            conversation,
+            exclude,
+            thread_account,
+            AccountSelection::Reserve,
+        )
+        .map_err(NoAvailableAccount::from)
+    }
+
+    pub(crate) async fn reserve_conversation(
+        self: &Arc<Self>,
+        conversation: &str,
+        exclude: &HashSet<String>,
+        thread_account: Option<&str>,
+        preferred_deadline: tokio::time::Instant,
+        busy_deadline: tokio::time::Instant,
+    ) -> Result<(AccountRecord, ActiveRequest), NoAvailableAccount> {
+        // Subscribe before checking capacity so a simultaneous release cannot be missed.
+        let mut changes = self.subscribe();
+        loop {
+            let now = tokio::time::Instant::now();
+            let selection = if (thread_account.is_some() || !conversation.is_empty())
+                && now < preferred_deadline
+            {
+                AccountSelection::WaitForPreferred
+            } else {
+                AccountSelection::Reserve
+            };
+            let deadline =
+                match self.try_reserve_request(conversation, exclude, thread_account, selection) {
+                    Err(AccountSelectionError::PreferredBusy) => preferred_deadline,
+                    Err(AccountSelectionError::NoAccount(NoAvailableAccount::Busy))
+                        if now < busy_deadline =>
+                    {
+                        busy_deadline
+                    }
+                    result => return result.map_err(NoAvailableAccount::from),
+                };
+            if matches!(
+                tokio::time::timeout_at(deadline, changes.recv()).await,
+                Ok(Err(broadcast::error::RecvError::Closed))
+            ) {
+                return self.reserve_request(conversation, exclude, thread_account);
+            }
+        }
+    }
+
+    fn try_reserve_request(
+        self: &Arc<Self>,
+        conversation: &str,
+        exclude: &HashSet<String>,
+        thread_account: Option<&str>,
+        selection: AccountSelection,
+    ) -> Result<(AccountRecord, ActiveRequest), AccountSelectionError> {
+        let record = self.select_account(conversation, exclude, thread_account, selection)?;
+        let request = ActiveRequest {
+            pool: self.clone(),
+            account_key: Some(record.key()),
+            started: false,
+        };
+        self.notify();
+        Ok((record, request))
+    }
+
+    fn select_account(
         &self,
         conversation: &str,
         exclude: &HashSet<String>,
         thread_account: Option<&str>,
-    ) -> Option<AccountRecord> {
+        selection: AccountSelection,
+    ) -> Result<AccountRecord, AccountSelectionError> {
         let now_ms = Utc::now().timestamp_millis();
         let max_conc = self.settings().max_concurrency;
         let primary = self.primary_key.read().clone();
+        let bound = self.session_account(conversation, Instant::now());
 
-        let mut accs = self.accounts.write();
-        // 恢复已过冷却期的账号状态。
-        for rt in accs.iter_mut() {
-            if let AccountHealth::CoolingDown { until_epoch_ms, .. } = rt.health {
-                if now_ms >= until_epoch_ms {
-                    rt.health = if rt.record.enabled {
-                        AccountHealth::Healthy
-                    } else {
-                        AccountHealth::Disabled
-                    };
-                }
-            }
-        }
-
-        let is_eligible = |rt: &AccountRuntime, allow_over_conc: bool| -> bool {
-            rt.record.enabled
-                && matches!(rt.health, AccountHealth::Healthy)
-                && !exclude.contains(&rt.record.key())
-                && (allow_over_conc || rt.active_requests < max_conc)
-        };
-
-        if let Some(account) = thread_account {
-            if let Some(rt) = accs
-                .iter()
-                .find(|a| is_eligible(a, false) && digest(&a.record.key()) == account)
+        let AccountsState {
+            records,
+            in_flight,
+            rr_cursor,
+        } = &mut *self.accounts.write();
+        for runtime in records.iter_mut() {
+            if let AccountHealth::CoolingDown { until_epoch_ms, .. } = runtime.health
+                && now_ms >= until_epoch_ms
             {
-                return Some(rt.record.clone());
+                runtime.health = if runtime.record.enabled {
+                    AccountHealth::Healthy
+                } else {
+                    AccountHealth::Disabled
+                };
             }
         }
 
-        // 1. 优先命中会话亲和绑定
-        if !conversation.is_empty() {
-            let mut aff = self.session_affinity.lock();
-            aff.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(6 * 3600));
-            if let Some((aff_key, _)) = aff.get(conversation) {
-                if let Some(rt) = accs.iter().find(|a| a.record.key() == *aff_key && is_eligible(a, false)) {
-                    return Some(rt.record.clone());
-                }
-            }
-        }
-
-        // 2. 筛选未超并发上限的候选账号，全满时退回允许超并发的可用账号
-        let eligible_indices: Vec<usize> = accs
+        let mut candidates: Vec<_> = records
             .iter()
-            .enumerate()
-            .filter(|(_, rt)| is_eligible(rt, false))
-            .map(|(i, _)| i)
+            .filter(|runtime| runtime.record.enabled && runtime.health == AccountHealth::Healthy)
+            .filter_map(|runtime| {
+                let key = runtime.record.key();
+                if exclude.contains(&key) {
+                    return None;
+                }
+                let active = in_flight.get(&key).copied().unwrap_or_default();
+                Some((runtime, key, active))
+            })
             .collect();
-
-        let candidates = if !eligible_indices.is_empty() {
-            eligible_indices
-        } else {
-            accs.iter()
-                .enumerate()
-                .filter(|(_, rt)| is_eligible(rt, true))
-                .map(|(i, _)| i)
-                .collect()
-        };
-
         if candidates.is_empty() {
-            return None;
+            return Err(AccountSelectionError::NoAccount(
+                NoAvailableAccount::Unavailable,
+            ));
         }
 
-        // 多账号时若主账号完全空闲则优先主账号，否则按轮询游标分发
-        if candidates.len() == 1 {
-            return Some(accs[candidates[0]].record.clone());
+        let matches_thread = |(_, key, _): &(_, String, _)| {
+            thread_account.is_some_and(|account| digest(key) == account)
+        };
+        let matches_bound = |(_, key, _): &(_, String, _)| bound.as_ref() == Some(key);
+        if selection == AccountSelection::WaitForPreferred
+            && candidates
+                .iter()
+                .find(|candidate| matches_thread(candidate))
+                .or_else(|| candidates.iter().find(|candidate| matches_bound(candidate)))
+                .is_some_and(|(_, _, active)| *active >= max_conc)
+        {
+            return Err(AccountSelectionError::PreferredBusy);
         }
-        if let Some(&pi) = candidates.iter().find(|&&i| accs[i].record.key() == primary && accs[i].active_requests == 0) {
-            return Some(accs[pi].record.clone());
+
+        let reserve = selection != AccountSelection::Lookup;
+        let has_capacity = |(_, _, active): &(_, _, usize)| *active < max_conc;
+        if reserve || candidates.iter().any(has_capacity) {
+            candidates.retain(has_capacity);
         }
-        let mut cursor = self.rr_cursor.lock();
-        let chosen_idx = candidates[*cursor % candidates.len()];
-        *cursor = cursor.wrapping_add(1);
-        Some(accs[chosen_idx].record.clone())
+        if candidates.is_empty() {
+            return Err(AccountSelectionError::NoAccount(NoAvailableAccount::Busy));
+        }
+
+        // 优先保留原线程或会话绑定，然后选择空闲主账号或按轮询分配。
+        let (runtime, key, _) = candidates
+            .iter()
+            .find(|candidate| matches_thread(candidate))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|candidate| has_capacity(candidate) && matches_bound(candidate))
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|(_, key, active)| *active == 0 && *key == primary)
+            })
+            .unwrap_or_else(|| {
+                if candidates.len() == 1 {
+                    return &candidates[0];
+                }
+                let chosen = &candidates[*rr_cursor % candidates.len()];
+                *rr_cursor = rr_cursor.wrapping_add(1);
+                chosen
+            });
+
+        if reserve {
+            // 与选择账号共用一把锁，名额先于异步续期和上游调用保留。
+            *in_flight.entry(key.clone()).or_default() += 1;
+        }
+        Ok(runtime.record.clone())
     }
 
     pub fn bind_session(&self, conversation: &str, account_key: &str) {
         if conversation.is_empty() {
             return;
         }
-        self.session_affinity
-            .lock()
-            .insert(conversation.to_string(), (account_key.to_string(), Instant::now()));
+        let conversation = digest(conversation);
+        let mut affinity = self.session_affinity.lock();
+        if affinity.len() >= MAX_SESSION_BINDINGS
+            && !affinity.contains_key(&conversation)
+            && let Some(oldest) = affinity
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| key.clone())
+        {
+            affinity.remove(&oldest);
+        }
+        affinity.insert(conversation, (account_key.to_owned(), Instant::now()));
     }
 
-    pub fn begin_request(&self, account_key: &str) {
+    fn session_account(&self, conversation: &str, now: Instant) -> Option<String> {
+        if conversation.is_empty() {
+            return None;
+        }
+        let conversation = digest(conversation);
+        self.session_affinity
+            .lock()
+            .get(&conversation)
+            .filter(|(_, at)| now.duration_since(*at) < SESSION_BINDING_TTL)
+            .map(|(key, _)| key.clone())
+    }
+
+    fn record_request_start(&self, account_key: &str) {
         {
             let mut accs = self.accounts.write();
-            if let Some(rt) = accs.iter_mut().find(|a| a.record.key() == account_key) {
-                rt.active_requests += 1;
+            if let Some(rt) = accs
+                .records
+                .iter_mut()
+                .find(|a| a.record.key() == account_key)
+            {
                 rt.total_requests += 1;
                 rt.last_used_at = Some(Instant::now());
             }
@@ -558,39 +720,28 @@ impl AccountPool {
         self.notify();
     }
 
-    pub(crate) fn track_request(self: &Arc<Self>, account_key: &str) -> ActiveRequest {
-        self.begin_request(account_key);
-        ActiveRequest {
-            pool: self.clone(),
-            account_key: Some(account_key.to_owned()),
-        }
-    }
-
-    pub fn end_request(&self, account_key: &str, resolved_model: Option<&str>) {
-        self.record_request_result(account_key, resolved_model, true);
-    }
-
-    #[cfg(feature = "gui")]
-    pub(crate) fn record_probe_model(&self, account_key: &str, resolved_model: &str) {
-        self.record_request_result(account_key, Some(resolved_model), false);
-    }
-
-    fn record_request_result(
-        &self,
-        account_key: &str,
-        resolved_model: Option<&str>,
-        finished_gateway_request: bool,
-    ) {
+    fn release_request(&self, account_key: String, started: bool, resolved_model: Option<&str>) {
         let resolved_model = resolved_model.filter(|model| !model.is_empty());
         {
             let mut accs = self.accounts.write();
-            if let Some(rt) = accs.iter_mut().find(|a| a.record.key() == account_key) {
-                if finished_gateway_request && rt.active_requests > 0 {
-                    rt.active_requests -= 1;
+            if (started || resolved_model.is_some())
+                && let Some(rt) = accs
+                    .records
+                    .iter_mut()
+                    .find(|a| a.record.key() == account_key)
+            {
+                if started {
                     rt.last_used_at = Some(Instant::now());
                 }
                 if let Some(m) = resolved_model {
                     rt.last_resolved_model = Some(m.to_string());
+                }
+            }
+            if let Entry::Occupied(mut slots) = accs.in_flight.entry(account_key) {
+                if *slots.get() == 1 {
+                    slots.remove();
+                } else {
+                    *slots.get_mut() -= 1;
                 }
             }
         }
@@ -612,7 +763,10 @@ impl AccountPool {
         let reason = reason.into();
         {
             let mut accs = self.accounts.write();
-            let rt = accs.iter_mut().find(|a| a.record.key() == account_key)?;
+            let rt = accs
+                .records
+                .iter_mut()
+                .find(|a| a.record.key() == account_key)?;
             if !rt.record.enabled || matches!(rt.health, AccountHealth::Expired { .. }) {
                 return None;
             }
@@ -647,6 +801,7 @@ impl AccountPool {
             let changed = {
                 let mut accounts = pool.accounts.write();
                 accounts
+                    .records
                     .iter_mut()
                     .find(|rt| rt.record.enabled && rt.record.key() == key)
                     .and_then(|rt| match &mut rt.health {
@@ -671,6 +826,7 @@ impl AccountPool {
         let now = Utc::now().timestamp_millis();
         self.accounts
             .read()
+            .records
             .iter()
             .filter(|rt| rt.record.enabled)
             .filter_map(|rt| match rt.health {
@@ -684,16 +840,58 @@ impl AccountPool {
     }
 
     pub fn mark_expired(&self, account_key: &str, reason: impl Into<String>) {
-        let reason_str = reason.into();
+        self.mark_expired_if_current(account_key, None, reason.into());
+    }
+
+    pub(crate) fn mark_credentials_expired(
+        &self,
+        attempted: &AccountRecord,
+        reason: impl Into<String>,
+    ) {
+        self.mark_expired_if_current(&attempted.key(), Some(attempted), reason.into());
+    }
+
+    fn mark_expired_if_current(
+        &self,
+        account_key: &str,
+        attempted: Option<&AccountRecord>,
+        reason: String,
+    ) {
+        let mut accounts = self.accounts.write();
+        let Some(account) = accounts
+            .records
+            .iter_mut()
+            .find(|account| account.record.key() == account_key)
+        else {
+            return;
+        };
+        // A refresh or a new sign-in may have replaced the rejected credential.
+        let current = &account.record;
+        if let Some(attempted) = attempted
+            && (!current.enabled
+                || current.access != attempted.access
+                || current.id_token != attempted.id_token
+                || current.refresh != attempted.refresh
+                || current.expires != attempted.expires)
         {
-            let mut accs = self.accounts.write();
-            if let Some(rt) = accs.iter_mut().find(|a| a.record.key() == account_key) {
-                rt.health = AccountHealth::Expired {
-                    reason: reason_str.clone(),
-                };
-            }
+            return;
         }
+        account.health = AccountHealth::Expired { reason };
+        drop(accounts);
         self.notify();
+    }
+
+    fn refreshable_account(&self, account_key: &str) -> Result<AccountRecord, OAuthError> {
+        let accounts = self.accounts.read();
+        let account = accounts
+            .records
+            .iter()
+            .find(|account| account.record.key() == account_key)
+            .ok_or_else(|| OAuthError::Expired("account not found".into()))?;
+        if let AccountHealth::Expired { reason } = &account.health {
+            return Err(OAuthError::Expired(reason.clone()));
+        }
+        Ok(account.record.clone())
     }
 
     /// 确保指定账号令牌有效（按账号维度加锁去重，避免并发重复刷新）。
@@ -702,13 +900,7 @@ impl AccountPool {
         account_key: &str,
         force: bool,
     ) -> std::result::Result<AccountRecord, OAuthError> {
-        let current = {
-            let accs = self.accounts.read();
-            accs.iter()
-                .find(|a| a.record.key() == account_key)
-                .map(|a| a.record.clone())
-        }
-        .ok_or_else(|| OAuthError::Expired("account not found".into()))?;
+        let current = self.refreshable_account(account_key)?;
 
         let now_ms = Utc::now().timestamp_millis();
         if !force && (current.expires == 0 || current.expires - now_ms > REFRESH_LEAD_MS) {
@@ -723,14 +915,8 @@ impl AccountPool {
         };
         let _guard = lock.lock().await;
 
-        // 获取锁后二次检查，防止等待期间已被其他并发请求刷新。
-        let latest = {
-            let accs = self.accounts.read();
-            accs.iter()
-                .find(|a| a.record.key() == account_key)
-                .map(|a| a.record.clone())
-        }
-        .ok_or_else(|| OAuthError::Expired("account not found".into()))?;
+        // 等待期间，其他请求可能已经刷新或确认凭证失效。
+        let latest = self.refreshable_account(account_key)?;
 
         let now_ms = Utc::now().timestamp_millis();
         if !force && (latest.expires == 0 || latest.expires - now_ms > REFRESH_LEAD_MS) {
@@ -745,9 +931,9 @@ impl AccountPool {
             }
             Err(e) => {
                 if e.is_expired() {
-                    self.mark_expired(account_key, e.to_string());
+                    self.mark_credentials_expired(&latest, e.to_string());
                     Err(e)
-                } else if !force && latest.expires > now_ms {
+                } else if !force && latest.expires > Utc::now().timestamp_millis() {
                     // 临时刷新异常但旧令牌尚未过期，继续复用当前令牌。
                     Ok(latest)
                 } else {
@@ -767,7 +953,11 @@ impl AccountPool {
             Ok(report) => {
                 {
                     let mut accs = self.accounts.write();
-                    if let Some(rt) = accs.iter_mut().find(|a| a.record.key() == account_key) {
+                    if let Some(rt) = accs
+                        .records
+                        .iter_mut()
+                        .find(|a| a.record.key() == account_key)
+                    {
                         rt.quota = Some(report.clone());
                         rt.quota_error = None;
                         rt.quota_updated_at = Some(Utc::now());
@@ -779,7 +969,11 @@ impl AccountPool {
             Err(e) => {
                 {
                     let mut accs = self.accounts.write();
-                    if let Some(rt) = accs.iter_mut().find(|a| a.record.key() == account_key) {
+                    if let Some(rt) = accs
+                        .records
+                        .iter_mut()
+                        .find(|a| a.record.key() == account_key)
+                    {
                         rt.quota_error = Some(e.message.clone());
                     }
                 }
@@ -793,6 +987,7 @@ impl AccountPool {
         let keys: Vec<String> = self
             .accounts
             .read()
+            .records
             .iter()
             .filter(|a| a.record.enabled)
             .map(|a| a.record.key())
@@ -805,16 +1000,18 @@ impl AccountPool {
     pub fn snapshot(&self) -> PoolSnapshot {
         let primary = self.primary_key.read().clone();
         let accs = self.accounts.read();
-        let active_total: usize = accs.iter().map(|a| a.active_requests).sum();
         let last_used_account_key = accs
+            .records
             .iter()
             .filter_map(|account| account.last_used_at.map(|at| (at, &account.record)))
             .max_by_key(|(at, _)| *at)
             .map(|(_, record)| record.key());
         let account_snaps: Vec<AccountSnapshot> = accs
+            .records
             .iter()
             .map(|a| {
                 let key = a.record.key();
+                let active_requests = accs.in_flight.get(&key).copied().unwrap_or_default();
                 AccountSnapshot {
                     is_primary: key == primary,
                     key,
@@ -823,7 +1020,7 @@ impl AccountPool {
                     tenant_url: a.record.tenant_url.clone(),
                     enabled: a.record.enabled,
                     health: a.health.clone(),
-                    active_requests: a.active_requests,
+                    active_requests,
                     total_requests: a.total_requests,
                     expires_ms: a.record.expires,
                     last_resolved_model: a.last_resolved_model.clone(),
@@ -835,10 +1032,10 @@ impl AccountPool {
             .collect();
         PoolSnapshot {
             config: self.config.read().clone(),
+            active_requests: account_snaps.iter().map(|a| a.active_requests).sum(),
             accounts: account_snaps,
             logs: self.logs.lock().iter().cloned().collect(),
             total_requests: self.request_stats.total_requests(),
-            active_requests: active_total,
             last_used_account_key,
             last_resolved_model: self.last_resolved_model.read().clone(),
         }
@@ -850,11 +1047,73 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn session_bindings_expire_and_evict_the_oldest_at_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = AccountPool::new(BridgeConfig::default(), AccountsFile::default(), dir.path());
+        pool.bind_session("expired", "account-a");
+        let inserted = pool.session_affinity.lock()[&digest("expired")].1;
+        assert_eq!(
+            pool.session_account("expired", inserted + SESSION_BINDING_TTL),
+            None
+        );
+
+        for index in 1..MAX_SESSION_BINDINGS {
+            pool.bind_session(&format!("session-{index}"), "account-a");
+        }
+        pool.bind_session("session-1", "account-b");
+        assert_eq!(pool.session_affinity.lock().len(), MAX_SESSION_BINDINGS);
+        let long_id = "long-session".repeat(1_000);
+        pool.bind_session(&long_id, "account-c");
+
+        let bindings = pool.session_affinity.lock();
+        assert_eq!(bindings.len(), MAX_SESSION_BINDINGS);
+        assert!(!bindings.contains_key(&digest("expired")));
+        assert!(bindings.keys().all(|key| key.len() == 24));
+        drop(bindings);
+        let now = Instant::now();
+        assert_eq!(
+            pool.session_account("session-1", now).as_deref(),
+            Some("account-b")
+        );
+        assert_eq!(
+            pool.session_account(&long_id, now).as_deref(),
+            Some("account-c")
+        );
+    }
+
+    #[test]
+    fn a_late_expiry_does_not_overwrite_a_new_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale: AccountRecord = serde_json::from_value(json!({
+            "accountId":"fixture", "tenantUrl":"https://example.test", "access":"old-fixture"
+        }))
+        .unwrap();
+        let mut current = stale.clone();
+        current.access = "new-fixture".into();
+        let pool = AccountPool::new(
+            BridgeConfig::default(),
+            AccountsFile {
+                primary_key: current.key(),
+                accounts: vec![current.clone()],
+            },
+            dir.path(),
+        );
+        pool.mark_credentials_expired(&stale, "old refresh was revoked");
+        assert_eq!(pool.snapshot().accounts[0].health, AccountHealth::Healthy);
+        pool.mark_credentials_expired(&current, "current refresh was revoked");
+        assert!(matches!(
+            pool.snapshot().accounts[0].health,
+            AccountHealth::Expired { .. }
+        ));
+    }
+
     #[cfg(feature = "gui")]
     #[test]
     fn usage_counts_gateway_attempts_and_survives_log_cleanup() {
         let dir = tempfile::tempdir().unwrap();
-        let make_pool = || AccountPool::new(BridgeConfig::default(), AccountsFile::default(), dir.path());
+        let make_pool =
+            || AccountPool::new(BridgeConfig::default(), AccountsFile::default(), dir.path());
         let pool = make_pool();
         let failure = RequestLogEntry {
             timestamp: Utc::now(),
@@ -934,18 +1193,27 @@ mod tests {
         };
         let (a, b) = (record("a"), record("b"));
         let (a_key, b_key) = (a.key(), b.key());
+        let mut config = BridgeConfig::default();
+        config.options.insert("max_concurrency".into(), json!(4));
         let pool = Arc::new(AccountPool::new(
-            BridgeConfig::default(),
+            config,
             AccountsFile {
                 primary_key: a_key.clone(),
                 accounts: vec![a, b],
             },
             dir.path(),
         ));
+        assert_eq!(pool.settings().max_concurrency, 4);
         assert_eq!(pool.snapshot().last_used_account_key, None);
 
-        let request_a = pool.track_request(&a_key);
-        let request_b = pool.track_request(&b_key);
+        let reserve = |preferred: &str| {
+            pool.reserve_request("conversation", &HashSet::new(), Some(&digest(preferred)))
+                .unwrap()
+        };
+        let (_, mut request_a) = reserve(&a_key);
+        request_a.start();
+        let (_, mut request_b) = reserve(&b_key);
+        request_b.start();
         let snapshot = pool.snapshot();
         assert_eq!(snapshot.accounts[0].active_requests, 1);
         assert_eq!(snapshot.accounts[1].active_requests, 1);
@@ -953,12 +1221,12 @@ mod tests {
 
         drop(request_a);
         pool.mark_cooldown(&a_key, None, "fixture quota exhausted");
-        let picked = pool.pick_account("conversation", &HashSet::new()).unwrap();
+        let (picked, mut retry) = reserve(&a_key);
         assert_eq!(picked.key(), b_key);
-        let retry = pool.track_request(&picked.key());
+        retry.start();
 
-        #[cfg(feature = "gui")]
-        pool.record_probe_model(&b_key, "probe-model");
+        let (_, probe) = reserve(&b_key);
+        probe.finish("probe-model");
         assert_eq!(pool.snapshot().accounts[1].active_requests, 2);
 
         request_b.finish("resolved-model");
@@ -968,8 +1236,6 @@ mod tests {
         assert_eq!(snapshot.active_requests, 1);
         retry.finish("");
 
-        #[cfg(feature = "gui")]
-        pool.record_probe_model(&a_key, "another-probe-model");
         let snapshot = pool.snapshot();
         assert_eq!(snapshot.active_requests, 0);
         assert_eq!(
@@ -981,5 +1247,42 @@ mod tests {
             snapshot.accounts[1].last_resolved_model.as_deref(),
             Some("resolved-model")
         );
+    }
+
+    #[test]
+    fn an_unstarted_reservation_survives_account_reload_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let record: AccountRecord = serde_json::from_value(json!({
+            "accountId": "fixture",
+            "tenantUrl": "https://example.test",
+            "access": "fixture-token",
+        }))
+        .unwrap();
+        let accounts = AccountsFile {
+            primary_key: record.key(),
+            accounts: vec![record],
+        };
+        let mut config = BridgeConfig::default();
+        config.options.insert("max_concurrency".into(), json!(1));
+        let pool = Arc::new(AccountPool::new(config, accounts.clone(), dir.path()));
+        let reserve = || pool.reserve_request("", &HashSet::new(), None);
+
+        let (_, before_refresh) = reserve().unwrap();
+        assert!(matches!(reserve(), Err(NoAvailableAccount::Busy)));
+        assert_eq!(pool.snapshot().total_requests, 0);
+
+        pool.apply_accounts_file(AccountsFile::default());
+        pool.apply_accounts_file(accounts);
+        assert!(matches!(reserve(), Err(NoAvailableAccount::Busy)));
+        assert_eq!(pool.snapshot().active_requests, 1);
+
+        drop(before_refresh);
+        assert_eq!(pool.snapshot().active_requests, 0);
+        let (_, mut retry) = reserve().unwrap();
+        retry.start();
+        retry.finish("resolved-model");
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.active_requests, 0);
     }
 }

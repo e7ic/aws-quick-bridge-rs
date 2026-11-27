@@ -133,12 +133,21 @@ impl BridgeApp {
         color: Hsla,
         points: Vec<QuotaTrendPoint>,
     ) -> impl IntoElement {
+        Self::quota_sparkline_at_height(t, color, points, QUOTA_TREND_HEIGHT)
+    }
+
+    pub(super) fn quota_sparkline_at_height(
+        t: Theme,
+        color: Hsla,
+        points: Vec<QuotaTrendPoint>,
+        height: f32,
+    ) -> impl IntoElement {
         let count = points.len();
         if count < 2 {
             let baseline = t.text_muted.opacity(0.48);
             return div()
                 .id("quota-sparkline-empty")
-                .h(px(QUOTA_TREND_HEIGHT))
+                .h(px(height))
                 .tooltip(Self::text_tooltip(t, "暂无历史走势"))
                 .child(
                     canvas(
@@ -194,8 +203,7 @@ impl BridgeApp {
                             0.5
                         };
                         let marker_radius = 3.0;
-                        let bottom =
-                            SPARKLINE_INSET + y * (QUOTA_TREND_HEIGHT - 2.0 * SPARKLINE_INSET);
+                        let bottom = SPARKLINE_INSET + y * (height - 2.0 * SPARKLINE_INSET);
                         div()
                             .id(("quota-sample", index))
                             .group("quota-sample")
@@ -226,7 +234,7 @@ impl BridgeApp {
         div()
             .id(("quota-sparkline", revision))
             .relative()
-            .h(px(QUOTA_TREND_HEIGHT))
+            .h(px(height))
             .child(Self::sparkline(values, color))
             .child(hover)
     }
@@ -905,6 +913,19 @@ fn chart_fraction(value: u64, ceiling: u64) -> f32 {
     (value as f64 / ceiling as f64) as f32
 }
 
+fn for_each_curve_segment(
+    mut from: Point<Pixels>,
+    points: impl Iterator<Item = Point<Pixels>>,
+    mut draw: impl FnMut(Point<Pixels>, Point<Pixels>, Point<Pixels>),
+) {
+    for to in points {
+        let dx = (to.x - from.x) / 3.0;
+        // 控制点与各自的端点等高，让同一时间段内的各条曲线使用相同的插值比例。
+        draw(to, point(from.x + dx, from.y), point(to.x - dx, to.y));
+        from = to;
+    }
+}
+
 fn paint_sparkline(window: &mut Window, bounds: Bounds<Pixels>, values: &[f32], color: Hsla) {
     let plot = bounds.inset(px(SPARKLINE_INSET));
     if values.is_empty() || plot.is_empty() {
@@ -917,22 +938,28 @@ fn paint_sparkline(window: &mut Window, bounds: Bounds<Pixels>, values: &[f32], 
         return;
     }
 
+    let marker = |index: usize, value: f32| {
+        let x = index as f32 / (values.len() - 1) as f32;
+        point(
+            plot.left() + plot.size.width * x,
+            plot.bottom() - plot.size.height * value,
+        )
+    };
+    let first = marker(0, values[0]);
+    let points = values
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(index, &value)| marker(index, value));
     let mut area = PathBuilder::fill();
     let mut line = PathBuilder::stroke(px(1.3));
     area.move_to(point(plot.left(), plot.bottom()));
-    for (index, &value) in values.iter().enumerate() {
-        let x = index as f32 / (values.len() - 1) as f32;
-        let marker = point(
-            plot.left() + plot.size.width * x,
-            plot.bottom() - plot.size.height * value,
-        );
-        area.line_to(marker);
-        if index == 0 {
-            line.move_to(marker);
-        } else {
-            line.line_to(marker);
-        }
-    }
+    area.line_to(first);
+    line.move_to(first);
+    for_each_curve_segment(first, points, |to, control_a, control_b| {
+        area.cubic_bezier_to(to, control_a, control_b);
+        line.cubic_bezier_to(to, control_a, control_b);
+    });
     area.line_to(point(plot.right(), plot.bottom()));
     area.close();
     if let Ok(path) = area.build() {
@@ -978,29 +1005,29 @@ fn paint_line(
     color: Hsla,
     width: f32,
 ) {
+    let points: [_; ACTIVITY_BUCKETS] = std::array::from_fn(|index| {
+        values[index].map(|value| {
+            let y = 1.0 - value.clamp(0.0, 1.0);
+            point(
+                latency_bucket_x(bounds, index),
+                bounds.origin.y + px(3.0) + (bounds.size.height - px(6.0)) * y,
+            )
+        })
+    });
     let mut path = PathBuilder::stroke(px(width));
-    let mut previous = false;
     let mut has_segment = false;
     let marker_radius = px(width + 0.5);
-    let mut points = [None; ACTIVITY_BUCKETS];
-    for (index, value) in values.into_iter().enumerate() {
-        let Some(value) = value else {
-            previous = false;
+    for run in points.split(Option::is_none) {
+        let [Some(first), rest @ ..] = run else {
             continue;
         };
-        let y = 1.0 - value.clamp(0.0, 1.0);
-        let marker = point(
-            latency_bucket_x(bounds, index),
-            bounds.origin.y + px(3.0) + (bounds.size.height - px(6.0)) * y,
+        path.move_to(*first);
+        for_each_curve_segment(
+            *first,
+            rest.iter().copied().flatten(),
+            |to, control_a, control_b| path.cubic_bezier_to(to, control_a, control_b),
         );
-        if previous {
-            path.line_to(marker);
-            has_segment = true;
-        } else {
-            path.move_to(marker);
-        }
-        previous = true;
-        points[index] = Some(marker);
+        has_segment |= !rest.is_empty();
     }
     if has_segment && let Ok(path) = path.build() {
         window.paint_path(path, color);
@@ -1074,7 +1101,45 @@ fn paint_ring_shares(
 
 #[cfg(test)]
 mod tests {
-    use super::{Bounds, format_tokens, latency_bucket_x, latency_reveal_bounds, point, px, size};
+    use super::{
+        Bounds, for_each_curve_segment, format_tokens, latency_bucket_x, latency_reveal_bounds,
+        point, px, size,
+    };
+
+    #[test]
+    fn curves_pass_through_samples_and_keep_series_ordered() {
+        let segments = |values: [f32; 5]| {
+            let points = values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| point(px(index as f32 * 3.0), px(value)));
+            let mut segments = Vec::new();
+            for_each_curve_segment(point(px(0.0), px(values[0])), points.skip(1), |to, a, b| {
+                segments.push([a, b, to]);
+            });
+            assert_eq!(segments.len(), values.len() - 1);
+            segments
+        };
+        let upper = [0.0, 6.0, 20.0, 20.0, 15.0];
+        let lower = [6.0, 6.0, 20.0, 20.0, 15.0];
+        for (index, (upper_segment, lower_segment)) in
+            segments(upper).into_iter().zip(segments(lower)).enumerate()
+        {
+            for (values, [a, b, to]) in [(upper, upper_segment), (lower, lower_segment)] {
+                assert_eq!(
+                    to,
+                    point(px((index + 1) as f32 * 3.0), px(values[index + 1]))
+                );
+                let y = px(values[index].min(values[index + 1]))
+                    ..=px(values[index].max(values[index + 1]));
+                assert!(y.contains(&a.y) && y.contains(&b.y));
+            }
+            for (upper, lower) in upper_segment.into_iter().zip(lower_segment) {
+                assert_eq!(upper.x, lower.x);
+                assert!(upper.y <= lower.y, "series crossed between samples");
+            }
+        }
+    }
 
     #[test]
     fn latency_reveal_starts_at_the_first_sample_in_a_sparse_plot() {

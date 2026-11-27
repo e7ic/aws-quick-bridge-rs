@@ -14,7 +14,9 @@ fn main() {
             }
             #[cfg(not(feature = "gui"))]
             {
-                eprintln!("Built without `gui` feature. Run `aws-quick-bridge-rs serve` or rebuild with `--features gui`.");
+                eprintln!(
+                    "Built without `gui` feature. Run `aws-quick-bridge-rs serve` or rebuild with `--features gui`."
+                );
                 std::process::exit(1);
             }
         }

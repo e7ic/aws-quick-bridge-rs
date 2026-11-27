@@ -457,6 +457,7 @@ pub(super) struct SlideFadeElement<E> {
     target: f32,
     offset: SlideOffset,
     config: SpringConfig,
+    fade: bool,
     child: Option<E>,
 }
 
@@ -506,6 +507,7 @@ pub(super) fn slide_fade<E: Styled + IntoElement + 'static>(
         target,
         offset: SlideOffset::Fixed(point(px(offset_x), px(offset_y))),
         config,
+        fade: true,
         child: Some(child),
     }
 }
@@ -527,8 +529,20 @@ pub(super) fn slide_fade_from_right<E: Styled + IntoElement + 'static>(
         target,
         offset: SlideOffset::WindowRight,
         config,
+        fade: true,
         child: Some(child),
     }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn menu_panel_slide<E: Styled + IntoElement + 'static>(
+    id: impl Into<ElementId>,
+    exiting: bool,
+    child: E,
+) -> SlideFadeElement<E> {
+    let mut slide = slide_fade_from_right(id, exiting, child);
+    slide.fade = false;
+    slide
 }
 
 impl<E: Styled + IntoElement + 'static> IntoElement for SlideFadeElement<E> {
@@ -589,7 +603,12 @@ impl<E: Styled + IntoElement + 'static> Element for SlideFadeElement<E> {
             request_frame(window);
         }
         let child = self.child.take().expect("child taken once");
-        let mut element = child.opacity(progress.clamp(0.0, 1.0)).into_any_element();
+        let opacity = if self.fade || reduced {
+            progress.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let mut element = child.opacity(opacity).into_any_element();
         let layout_id = element.request_layout(window, cx);
         let remaining = if reduced { 0.0 } else { 1.0 - progress };
         (layout_id, SlideFadeLayoutState { element, remaining })

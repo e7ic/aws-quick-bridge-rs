@@ -8,7 +8,6 @@ use rand::Rng;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -19,13 +18,23 @@ pub const DEFAULT_HOST: &str = "127.0.0.1";
 pub const REFRESH_LEAD_MS: i64 = 10 * 60_000;
 pub const MODES: &[&str] = &["smart", "fast", "balanced", "auto"];
 pub const AGENT_MODES: &[&str] = &["smart", "fast", "balanced", "auto", "advanced"];
+pub(crate) const THINKING_EFFORTS: &[&str] = &["off", "low", "medium", "high", "max"];
+
+pub(crate) fn normalize_thinking_effort(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some("off"),
+        "minimal" => Some("low"),
+        "xhigh" => Some("max"),
+        value => THINKING_EFFORTS
+            .iter()
+            .copied()
+            .find(|effort| *effort == value),
+    }
+}
 
 // 客户端协议角色与网关档位的对应关系。
-pub(crate) const CLAUDE_ROLE_MODES: &[(&str, &str)] = &[
-    ("sonnet", "balanced"),
-    ("opus", "smart"),
-    ("haiku", "fast"),
-];
+pub(crate) const CLAUDE_ROLE_MODES: &[(&str, &str)] =
+    &[("sonnet", "balanced"), ("opus", "smart"), ("haiku", "fast")];
 pub(crate) const CLAUDE_DESKTOP_AUTO_ID: &str = "claude-auto-bridge";
 
 pub fn model_display_name(id: &str) -> String {
@@ -147,9 +156,7 @@ pub(crate) fn resolve_quick_model(requested: &str) -> Option<&'static str> {
         .captures(&id)
         .and_then(|caps| caps.name("family").or_else(|| caps.name("legacy_family")))
         .map_or(id.as_str(), |name| name.as_str());
-    let alias = id
-        .strip_prefix("claude-")
-        .and_then(|id| id.split_once('-'));
+    let alias = id.strip_prefix("claude-").and_then(|id| id.split_once('-'));
     CLAUDE_ROLE_MODES.iter().find_map(|&(role, mode)| {
         let matches_alias = alias.is_some_and(|(family, suffix)| {
             family == role && (suffix == "bridge" || suffix.strip_prefix("quick-") == Some(mode))
@@ -220,6 +227,7 @@ pub struct Settings {
     pub max_frame_bytes: usize,
     pub default_model: String,
     pub request_timeout_ms: u64,
+    pub(crate) extend_active_request_timeout: bool,
     pub keepalive_ms: u64,
     pub header_wait_ms: u64,
     pub show_quick_tools: bool,
@@ -244,14 +252,14 @@ impl Settings {
                 .to_string()
         };
         let bool_opt = |key: &str, default_val: bool| -> bool {
-            opts.get(key).and_then(|v| v.as_bool()).unwrap_or(default_val)
+            opts.get(key)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(default_val)
         };
 
-        let effort_raw = text("thinking_effort", "").to_ascii_lowercase();
-        let thinking_effort = match effort_raw.as_str() {
-            "off" | "low" | "medium" | "high" => effort_raw,
-            _ => String::new(),
-        };
+        let thinking_effort = normalize_thinking_effort(&text("thinking_effort", ""))
+            .unwrap_or_default()
+            .to_owned();
 
         let max_frame_bytes = opts
             .get("max_frame_bytes")
@@ -284,9 +292,9 @@ impl Settings {
         let max_concurrency = opts
             .get("max_concurrency")
             .and_then(|v| v.as_u64())
-            .filter(|&n| n >= 1 && n <= 64)
+            .filter(|&n| (1..=64).contains(&n))
             .map(|n| n as usize)
-            .unwrap_or(4);
+            .unwrap_or(2);
 
         let stage = normalize_stage(&text("build_stage", "prod"));
 
@@ -306,6 +314,7 @@ impl Settings {
             max_frame_bytes,
             default_model: map_model(&text("default_model", "smart"), "smart"),
             request_timeout_ms: duration_ms(opts.get("request_timeout"), 5 * 60_000),
+            extend_active_request_timeout: !opts.contains_key("request_timeout"),
             keepalive_ms,
             header_wait_ms,
             show_quick_tools: bool_opt("show_quick_tools", true),
@@ -516,30 +525,25 @@ pub fn load_accounts() -> AccountsFile {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
-    if let Ok(raw) = fs::read_to_string(legacy_account_path()) {
-        if let Ok(legacy) = serde_json::from_str::<AccountRecord>(&raw) {
-            if legacy.is_valid() {
-                let key = legacy.key();
-                if let Some(existing) = file.accounts.iter_mut().find(|a| a.key() == key) {
-                    if legacy.expires > existing.expires {
-                        let enabled = existing.enabled;
-                        *existing = legacy;
-                        existing.enabled = enabled;
-                    }
-                } else {
-                    file.accounts.push(legacy);
-                }
+    if let Ok(raw) = fs::read_to_string(legacy_account_path())
+        && let Ok(legacy) = serde_json::from_str::<AccountRecord>(&raw)
+        && legacy.is_valid()
+    {
+        let key = legacy.key();
+        if let Some(existing) = file.accounts.iter_mut().find(|a| a.key() == key) {
+            if legacy.expires > existing.expires {
+                let enabled = existing.enabled;
+                *existing = legacy;
+                existing.enabled = enabled;
             }
+        } else {
+            file.accounts.push(legacy);
         }
     }
 
     file.accounts.retain(|a| a.is_valid());
     if file.primary_key.is_empty() || !file.accounts.iter().any(|a| a.key() == file.primary_key) {
-        file.primary_key = file
-            .accounts
-            .first()
-            .map(|a| a.key())
-            .unwrap_or_default();
+        file.primary_key = file.accounts.first().map(|a| a.key()).unwrap_or_default();
     }
     file
 }
@@ -582,13 +586,10 @@ pub fn upsert_account(mut record: AccountRecord) -> Result<AccountsFile> {
 
 pub fn remove_account(key: &str) -> Result<AccountsFile> {
     let mut file = load_accounts();
-    file.accounts.retain(|a| a.key() != key && a.account_id != key);
+    file.accounts
+        .retain(|a| a.key() != key && a.account_id != key);
     if !file.accounts.iter().any(|a| a.key() == file.primary_key) {
-        file.primary_key = file
-            .accounts
-            .first()
-            .map(|a| a.key())
-            .unwrap_or_default();
+        file.primary_key = file.accounts.first().map(|a| a.key()).unwrap_or_default();
     }
     save_accounts(&file)?;
     Ok(file)
@@ -602,56 +603,47 @@ pub fn remove_all_accounts() -> Result<()> {
     Ok(())
 }
 
+fn model_slot_enabled(settings: &Value, mode: &str) -> Option<bool> {
+    let slots = settings
+        .get("model_slots")
+        .or_else(|| settings.get("modelSlots"))?;
+    let enabled = |slot: &Value| slot["enabled"].as_bool().unwrap_or(true);
+    match slots {
+        Value::Array(slots) => slots
+            .iter()
+            .filter(|slot| slot["id"].as_str() == Some(mode))
+            .map(enabled)
+            .reduce(|left, right| left && right),
+        Value::Object(slots) => slots.get(mode).filter(|slot| slot.is_object()).map(enabled),
+        _ => None,
+    }
+}
+
+pub(crate) fn advanced_supported(settings: &Value) -> Option<bool> {
+    let entitlement = settings["advanced_mode_enabled"]
+        .as_bool()
+        .or_else(|| settings["advancedModeEnabled"].as_bool());
+    let slot = model_slot_enabled(settings, "advanced");
+    if entitlement == Some(false) || slot == Some(false) {
+        return Some(false);
+    }
+    entitlement.or(slot)
+}
+
 /// 根据账号 `get_settings` 返回结果过滤并补充可用模型列表。
 pub fn account_models(account_settings: Option<&Value>) -> Vec<String> {
-    let mut map: BTreeMap<String, bool> = MODES.iter().map(|m| (m.to_string(), true)).collect();
-    let mut advanced = false;
-
-    if let Some(acc) = account_settings.and_then(|v| v.as_object()) {
-        if acc.get("advanced_mode_enabled").and_then(|v| v.as_bool()) == Some(true) {
-            advanced = true;
-        }
-        if let Some(slots) = acc.get("model_slots") {
-            match slots {
-                Value::Array(arr) => {
-                    for s in arr {
-                        if let Some(obj) = s.as_object() {
-                            if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
-                                if obj.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
-                                    map.remove(id);
-                                } else if id == "advanced" {
-                                    advanced = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                Value::Object(obj) => {
-                    for (id, slot) in obj {
-                        if let Some(so) = slot.as_object() {
-                            if so.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
-                                map.remove(id);
-                            } else if id == "advanced" {
-                                advanced = true;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+    let mut models: Vec<_> = MODES
+        .iter()
+        .copied()
+        .filter(|mode| {
+            account_settings.and_then(|settings| model_slot_enabled(settings, mode)) != Some(false)
+        })
+        .map(str::to_owned)
+        .collect();
+    if account_settings.and_then(advanced_supported) == Some(true) {
+        models.push("advanced".into());
     }
-
-    let mut out = Vec::new();
-    for m in MODES {
-        if map.contains_key(*m) {
-            out.push((*m).to_string());
-        }
-    }
-    if advanced && !out.iter().any(|m| m == "advanced") {
-        out.push("advanced".to_string());
-    }
-    out
+    models
 }
 
 #[cfg(test)]

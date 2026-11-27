@@ -1,10 +1,12 @@
 //! 命令行接口（供无头或终端场景与 GPUI 桌面端并行使用）。
 
 use crate::config::{
-    DEFAULT_HOST, DEFAULT_PORT, load_config, remove_account, remove_all_accounts, rotate_api_key,
-    save_config,
+    DEFAULT_HOST, DEFAULT_PORT, THINKING_EFFORTS, load_config, remove_account, remove_all_accounts,
+    rotate_api_key, save_config,
 };
-use crate::gateway::ccswitch::{APPS, CLAUDE_DESKTOP_APP, detect_lan_ip, endpoint_for, import_link};
+use crate::gateway::ccswitch::{
+    APPS, CLAUDE_DESKTOP_APP, detect_lan_ip, endpoint_for, import_link,
+};
 use crate::gateway::start_server;
 use crate::login::start_browser_sign_in;
 use crate::pool::AccountPool;
@@ -57,6 +59,16 @@ pub enum Command {
     Probe {
         #[arg(default_value = "smart")]
         models: Vec<String>,
+        /// 指定思考档位，支持逗号分隔。默认沿用网关设置。
+        #[arg(
+            long,
+            value_name = "LEVEL",
+            value_delimiter = ',',
+            value_parser = clap::builder::PossibleValuesParser::new(
+                std::iter::once("auto").chain(THINKING_EFFORTS.iter().copied()),
+            ),
+        )]
+        thinking_effort: Vec<String>,
     },
     /// 输出或直接打开 CC Switch 导入深链
     Ccswitch {
@@ -79,9 +91,7 @@ pub enum Command {
         new: bool,
     },
     /// 移除本地保存的账号凭据（不传参数时清除全部账号）
-    Logout {
-        account: Option<String>,
-    },
+    Logout { account: Option<String> },
 }
 
 fn display_base(host: &str, port: u16) -> String {
@@ -107,24 +117,37 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     cfg.host.clone()
                 }
             });
-            let p = port.unwrap_or(if cfg.port == 0 { DEFAULT_PORT } else { cfg.port });
+            let p = port.unwrap_or(if cfg.port == 0 {
+                DEFAULT_PORT
+            } else {
+                cfg.port
+            });
             let mut srv = start_server(pool.clone(), &h, p).await?;
             let at = display_base(&h, srv.addr.port());
             let snap = pool.snapshot();
             println!("aws-quick-bridge-rs listening on http://{}", srv.addr);
             println!("  key:      {}", cfg.api_key);
             println!("  accounts: {} configured", snap.accounts.len());
-            println!("  Claude Code   {}   (Anthropic Messages)", endpoint_for("claude", &at));
+            println!(
+                "  Claude Code   {}   (Anthropic Messages)",
+                endpoint_for("claude", &at)
+            );
             println!(
                 "  Claude Desktop {}   (Anthropic Messages)",
                 endpoint_for(CLAUDE_DESKTOP_APP, &at)
             );
-            println!("  Codex         {}   (OpenAI Responses)", endpoint_for("codex", &at));
-            println!("  OpenCode      {}   (OpenAI Chat Completions)", endpoint_for("opencode", &at));
-            if h == "0.0.0.0" {
-                if let Some(ip) = detect_lan_ip() {
-                    println!("  LAN URL:      http://{ip}:{}", srv.addr.port());
-                }
+            println!(
+                "  Codex         {}   (OpenAI Responses)",
+                endpoint_for("codex", &at)
+            );
+            println!(
+                "  OpenCode      {}   (OpenAI Chat Completions)",
+                endpoint_for("opencode", &at)
+            );
+            if h == "0.0.0.0"
+                && let Some(ip) = detect_lan_ip()
+            {
+                println!("  LAN URL:      http://{ip}:{}", srv.addr.port());
             }
 
             let mut rx = pool.subscribe();
@@ -138,7 +161,12 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                     let logs = pool_log.snapshot().logs;
                     if logs.len() > printed {
                         for entry in &logs[printed..] {
-                            println!("{} [{}] {}", entry.timestamp.to_rfc3339(), entry.api, entry.message);
+                            println!(
+                                "{} [{}] {}",
+                                entry.timestamp.to_rfc3339(),
+                                entry.api,
+                                entry.message
+                            );
                         }
                         printed = logs.len();
                     }
@@ -154,7 +182,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             let pool = AccountPool::load()?;
             let settings = pool.settings();
             let handle = start_browser_sign_in(&settings).await?;
-            println!("Sign in to Amazon Quick in the browser:\n\n  {}\n", handle.start_url);
+            println!(
+                "Sign in to Amazon Quick in the browser:\n\n  {}\n",
+                handle.start_url
+            );
             if !no_open {
                 let _ = open::that(&handle.start_url);
             }
@@ -164,26 +195,25 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 let stdin = std::io::stdin();
                 for line in stdin.lock().lines().map_while(Result::ok) {
                     let trimmed = line.trim().to_string();
-                    if let Ok(mut u) = url::Url::parse(&trimmed) {
-                        if matches!(u.host_str(), Some("localhost") | Some("127.0.0.1")) {
-                            let _ = u.set_host(Some("127.0.0.1"));
-                            let client = reqwest::Client::builder()
-                                .redirect(reqwest::redirect::Policy::none())
-                                .build();
-                            if let Ok(c) = client {
-                                let url_str = u.to_string();
-                                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                {
-                                    let _ = rt.block_on(async {
-                                        if let Ok(r) = c.get(&url_str).send().await {
-                                            if let Some(loc) = r.headers().get("location").and_then(|v| v.to_str().ok()) {
+                    if let Ok(mut u) = url::Url::parse(&trimmed)
+                        && matches!(u.host_str(), Some("localhost") | Some("127.0.0.1"))
+                    {
+                        let _ = u.set_host(Some("127.0.0.1"));
+                        let client = reqwest::Client::builder()
+                            .redirect(reqwest::redirect::Policy::none())
+                            .build();
+                        if let Ok(c) = client {
+                            let url_str = u.to_string();
+                            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                            {
+                                rt.block_on(async {
+                                        if let Ok(r) = c.get(&url_str).send().await
+                                            && let Some(loc) = r.headers().get("location").and_then(|v| v.to_str().ok()) {
                                                 println!("\nNow open this page, and paste the address it ends on:\n\n  {loc}\n");
                                             }
-                                        }
                                     });
-                                }
                             }
                         }
                     }
@@ -209,7 +239,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 .await
                 .map(|r| r.status().is_success())
                 .unwrap_or(false);
-            println!("API:      {at}  ({})", if up { "running" } else { "not running" });
+            println!(
+                "API:      {at}  ({})",
+                if up { "running" } else { "not running" }
+            );
             println!("Bind:     {}:{}", cfg.host, cfg.port);
             println!("Key:      {}", cfg.api_key);
             let snap = pool.snapshot();
@@ -278,7 +311,10 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Command::Probe { models } => {
+        Command::Probe {
+            models,
+            thinking_effort,
+        } => {
             let pool = AccountPool::load()?;
             let cfg = pool.settings();
             let Some(picked) = pool.pick_account("", &std::collections::HashSet::new()) else {
@@ -290,33 +326,47 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let session = UpstreamSession::from_auth(&auth, &cfg);
             let (_tx, cancel_rx) = watch::channel(false);
-            for m in models {
-                let input = TurnInput {
-                    prompt: "hi".to_string(),
-                    model: m.clone(),
-                    thread_id: String::new(),
-                    title: "probe".to_string(),
-                    system_prompt: String::new(),
-                    reminder: String::new(),
-                    thinking_effort: String::new(),
-                    web_search: false,
-                    resume: false,
-                    attachments: Vec::new(),
-                };
-                let res = chat(&session, &cfg, &input, cancel_rx.clone(), None)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e.message))?;
-                println!(
-                    "probe {m}: resolved_model_id={} (in={}, out={}, cached={})",
-                    if res.usage.resolved_model_id.is_empty() {
-                        "(none)"
-                    } else {
-                        &res.usage.resolved_model_id
-                    },
-                    res.usage.prompt,
-                    res.usage.completion,
-                    res.usage.cache_read,
-                );
+            let efforts = if thinking_effort.is_empty() {
+                vec![cfg.thinking_effort.as_str()]
+            } else {
+                thinking_effort.iter().map(String::as_str).collect()
+            };
+            for model in models {
+                for &effort in &efforts {
+                    let label = if effort.is_empty() { "auto" } else { effort };
+                    let input = TurnInput {
+                        prompt: "hi".to_string(),
+                        model: model.clone(),
+                        thread_id: String::new(),
+                        title: "probe".to_string(),
+                        system_prompt: String::new(),
+                        reminder: String::new(),
+                        thinking_effort: if effort == "auto" {
+                            String::new()
+                        } else {
+                            effort.to_owned()
+                        },
+                        web_search: false,
+                        resume: false,
+                        attachments: Vec::new(),
+                    };
+                    let res = chat(&session, &cfg, &input, cancel_rx.clone(), None)
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!("probe {model} (effort={label}): {}", error.message)
+                        })?;
+                    println!(
+                        "probe {model}: resolved_model_id={} (in={}, out={}, cached={}) effort={label}",
+                        if res.usage.resolved_model_id.is_empty() {
+                            "(none)"
+                        } else {
+                            &res.usage.resolved_model_id
+                        },
+                        res.usage.prompt,
+                        res.usage.completion,
+                        res.usage.cache_read,
+                    );
+                }
             }
             Ok(())
         }

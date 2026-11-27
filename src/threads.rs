@@ -2,6 +2,7 @@
 
 use crate::config::write_secure_file;
 use crate::messages::{argument_string, content_text, role_of};
+use crate::qbs::UploadedAttachment;
 use crate::toolbridge::ToolCallReply;
 use chrono::Utc;
 use http::HeaderMap;
@@ -109,7 +110,7 @@ fn message_key(message: &Value, role: &str) -> String {
     )
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Continuation {
     from: usize,
     prefix: String,
@@ -117,7 +118,7 @@ struct Continuation {
     tail: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ThreadHistory {
     scope: String,
     prefix: String,
@@ -161,10 +162,30 @@ impl ThreadHistory {
             continuation: continuation.filter(|c| c.from < messages.len()),
         }
     }
+
+    pub(crate) fn with_routed_mode(&self, mode: &str) -> Self {
+        // Keep a fallback route separate from both the requested and the direct model.
+        let mut history = self.clone();
+        history.scope = combine([self.scope.as_str(), mode]);
+        history
+    }
 }
 
 fn tail_key(keys: &VecDeque<String>) -> Option<String> {
     (keys.len() == ANCHOR_MESSAGES).then(|| combine(keys))
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct ToolAnchor {
+    pub full: bool,
+    pub reused_turns: u8,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct ThreadPrompt {
+    pub custom: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_anchor: Option<ToolAnchor>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -172,21 +193,33 @@ struct ThreadEntry {
     id: String,
     account: String,
     scope: String,
-    custom: String,
+    #[serde(flatten)]
+    prompt: ThreadPrompt,
     prefix: String,
     reply: String,
     tail: Option<String>,
     message_count: usize,
     updated_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stopped: Option<StoppedTurn>,
     #[serde(skip)]
     busy: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoppedTurn {
+    // Re-send only the same request tail, from the last committed reply.
+    from: usize,
+    #[serde(skip)]
+    attachment: Option<UploadedAttachment>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ThreadMatch {
     pub(crate) id: String,
-    pub(crate) custom: String,
+    pub(crate) prompt: ThreadPrompt,
     pub(crate) from: usize,
+    pub(crate) attachment: Option<UploadedAttachment>,
 }
 
 #[derive(Debug, Default)]
@@ -216,39 +249,49 @@ impl ThreadStore {
         }
     }
 
-    fn best_match(&self, history: &ThreadHistory, account: Option<&str>) -> Option<usize> {
-        let c = history.continuation.as_ref()?;
+    fn best_match(
+        &self,
+        history: &ThreadHistory,
+        account: Option<&str>,
+        include_busy: bool,
+    ) -> Option<(usize, usize)> {
         let now = Utc::now().timestamp_millis();
         self.threads
             .iter()
             .enumerate()
             .filter(|(_, t)| {
-                !t.busy
+                (include_busy || !t.busy)
                     && t.scope == history.scope
                     && account.is_none_or(|account| t.account == account)
                     && (0..THREAD_TTL_MS).contains(&now.saturating_sub(t.updated_at))
             })
             .filter_map(|(i, t)| {
+                if let Some(stopped) = &t.stopped {
+                    return (t.prefix == history.prefix).then_some((3, i, stopped.from));
+                }
+                let c = history.continuation.as_ref()?;
                 if t.prefix == c.prefix {
-                    Some((2, i))
+                    Some((2, i, c.from))
                 } else if history.has_session
                     && c.from < t.message_count
                     && t.reply == c.reply
                     && t.tail.is_some()
                     && t.tail == c.tail
                 {
-                    Some((1, i))
+                    Some((1, i, c.from))
                 } else {
                     None
                 }
             })
             .max()
-            .map(|(_, i)| i)
+            .map(|(_, i, from)| (i, from))
     }
 
     pub(crate) fn preferred_account(&self, history: &ThreadHistory) -> Option<&str> {
-        self.best_match(history, None)
-            .map(|i| self.threads[i].account.as_str())
+        self.best_match(history, None, false)
+            // A running thread can identify the account to wait for, but cannot be claimed.
+            .or_else(|| self.best_match(history, None, true))
+            .map(|(i, _)| self.threads[i].account.as_str())
     }
 
     pub(crate) fn match_thread(
@@ -256,13 +299,14 @@ impl ThreadStore {
         account: &str,
         history: &ThreadHistory,
     ) -> Option<ThreadMatch> {
-        let index = self.best_match(history, Some(account))?;
+        let (index, from) = self.best_match(history, Some(account), false)?;
         let entry = &mut self.threads[index];
         entry.busy = true;
         Some(ThreadMatch {
             id: entry.id.clone(),
-            custom: entry.custom.clone(),
-            from: history.continuation.as_ref()?.from,
+            prompt: entry.prompt.clone(),
+            from,
+            attachment: entry.stopped.as_ref().and_then(|s| s.attachment.clone()),
         })
     }
 
@@ -271,7 +315,7 @@ impl ThreadStore {
         history: &ThreadHistory,
         id: String,
         account: String,
-        custom: String,
+        prompt: ThreadPrompt,
         text: &str,
         tools: &[ToolCallReply],
     ) {
@@ -283,14 +327,50 @@ impl ThreadStore {
             id,
             account,
             scope: history.scope.clone(),
-            custom,
+            prompt,
             prefix: combine([&history.prefix, &reply]),
             reply,
             tail: history.tail.clone(),
             message_count: history.message_count + 1,
             updated_at: Utc::now().timestamp_millis(),
+            stopped: None,
             busy: false,
         };
+        Self::save_entry(store, entry).await;
+    }
+
+    pub(crate) async fn remember_stopped(
+        store: Arc<Mutex<Self>>,
+        history: &ThreadHistory,
+        id: &str,
+        account: &str,
+        previous: Option<&ThreadMatch>,
+        attachment: Option<UploadedAttachment>,
+    ) {
+        // Identical anonymous opening prompts can be separate conversations.
+        if previous.is_none() && !history.has_session && history.continuation.is_none() {
+            return;
+        }
+        let entry = ThreadEntry {
+            id: id.to_owned(),
+            account: account.to_owned(),
+            scope: history.scope.clone(),
+            prompt: previous.map(|t| t.prompt.clone()).unwrap_or_default(),
+            prefix: history.prefix.clone(),
+            reply: String::new(),
+            tail: None,
+            message_count: history.message_count,
+            updated_at: Utc::now().timestamp_millis(),
+            stopped: Some(StoppedTurn {
+                from: previous.map_or(0, |t| t.from),
+                attachment,
+            }),
+            busy: false,
+        };
+        Self::save_entry(store, entry).await;
+    }
+
+    async fn save_entry(store: Arc<Mutex<Self>>, entry: ThreadEntry) {
         let _ = tokio::task::spawn_blocking(move || {
             let mut store = store.lock();
             store.threads.retain(|t| {
@@ -321,12 +401,12 @@ impl ThreadStore {
     }
 
     fn persist(&self) {
-        if let Some(path) = &self.path {
-            if let Ok(data) = serde_json::to_vec(&self.threads) {
-                // A write failure only loses restart persistence. Live matching
-                // continues from the entries held in memory.
-                let _ = write_secure_file(path, &data);
-            }
+        if let Some(path) = &self.path
+            && let Ok(data) = serde_json::to_vec(&self.threads)
+        {
+            // A write failure only loses restart persistence. Live matching
+            // continues from the entries held in memory.
+            let _ = write_secure_file(path, &data);
         }
     }
 }
@@ -335,6 +415,51 @@ impl ThreadStore {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn stopped_opening_turn_requires_an_identifiable_conversation_and_exact_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.json");
+        let store = Arc::new(Mutex::new(ThreadStore::load(path.clone())));
+        let request = |session, text| {
+            ThreadHistory::new(
+                session,
+                "smart",
+                "system",
+                &[json!({"role":"user","content":text})],
+            )
+        };
+        let anonymous = request("", "same opening question");
+        ThreadStore::remember_stopped(
+            store.clone(),
+            &anonymous,
+            "ambiguous",
+            "account",
+            None,
+            None,
+        )
+        .await;
+        assert!(store.lock().preferred_account(&anonymous).is_none());
+        let original = request("session", "same opening question");
+        ThreadStore::remember_stopped(store, &original, "stopped-thread", "account", None, None)
+            .await;
+        let mut restored = ThreadStore::load(path);
+        assert!(
+            restored
+                .preferred_account(&request("other", "same opening question"))
+                .is_none()
+        );
+        assert!(
+            restored
+                .preferred_account(&request("session", "edited request"))
+                .is_none()
+        );
+        assert!(restored.match_thread("other-account", &original).is_none());
+        let matched = restored.match_thread("account", &original).unwrap();
+        assert_eq!(matched.id, "stopped-thread");
+        assert_eq!(matched.from, 0);
+        assert!(restored.match_thread("account", &original).is_none());
+    }
 
     #[tokio::test]
     async fn persisted_thread_matches_an_append_and_a_shortened_history() {
@@ -354,7 +479,13 @@ mod tests {
             &history,
             "quick-thread".into(),
             "account-digest".into(),
-            "instruction-digest".into(),
+            ThreadPrompt {
+                custom: "instruction-digest".into(),
+                tool_anchor: Some(ToolAnchor {
+                    full: false,
+                    reused_turns: 4,
+                }),
+            },
             "latest answer",
             &[],
         )
@@ -365,6 +496,12 @@ mod tests {
         assert!(!data.contains("original private question"));
         assert!(!data.contains("latest answer"));
         assert!(data.len() < 600);
+
+        let mut old_format: Value = serde_json::from_str(&data).unwrap();
+        old_format[0].as_object_mut().unwrap().remove("tool_anchor");
+        let old_entry: ThreadEntry = serde_json::from_value(old_format[0].take()).unwrap();
+        assert_eq!(old_entry.prompt.custom, "instruction-digest");
+        assert!(old_entry.prompt.tool_anchor.is_none());
 
         let mut restored = ThreadStore::load(path);
         let mut follow_up = original.to_vec();
@@ -380,6 +517,9 @@ mod tests {
         assert!(restored.match_thread("different-account", &full).is_none());
         let matched = restored.match_thread("account-digest", &full).unwrap();
         assert_eq!(matched.from, 6);
+        let anchor = matched.prompt.tool_anchor.unwrap();
+        assert!(!anchor.full);
+        assert_eq!(anchor.reused_turns, 4);
         assert!(restored.match_thread("account-digest", &full).is_none());
         restored.release(&matched.id);
 

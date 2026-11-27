@@ -7,7 +7,7 @@ use super::{
     AccountFilter, BridgeApp, GuiShared, LogFilter, MONO_FONT, PendingAction, SIDEBAR_LOGO_HEIGHT,
     SIDEBAR_LOGO_WIDTH, SignInState, THEME_TRANSITION, Tab, logo_source, numeric_font, ui_font,
 };
-use crate::config::{Settings, generate_api_key, model_display_name};
+use crate::config::{Settings, THINKING_EFFORTS, generate_api_key, model_display_name};
 use crate::gateway::ccswitch::{APPS, CLAUDE_DESKTOP_APP, endpoint_for, import_link};
 use crate::pool::{AccountHealth, AccountSnapshot, LogLevel, RequestLogEntry};
 use chrono::{Local, Utc};
@@ -207,12 +207,7 @@ impl BridgeApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let running = shared.server_running;
-        let (icon, label) = match (shared.gateway_busy, running) {
-            (true, false) => ("icons/refresh-bold.svg", "正在启动"),
-            (true, true) => ("icons/refresh-bold.svg", "正在停止"),
-            (false, true) => ("icons/stop-bold.svg", "停止网关"),
-            (false, false) => ("icons/play-bold.svg", "启动网关"),
-        };
+        let (icon, label) = shared.gateway_button_content();
         Self::button(
             t,
             id,
@@ -235,7 +230,12 @@ impl BridgeApp {
         )
     }
 
-    fn gateway_status(t: Theme, shared: &GuiShared, id: &'static str, compact: bool) -> AnyElement {
+    pub(super) fn gateway_status(
+        t: Theme,
+        shared: &GuiShared,
+        id: &'static str,
+        compact: bool,
+    ) -> AnyElement {
         if shared.gateway_busy {
             let (width, height) = if compact { (46.0, 10.0) } else { (56.0, 22.0) };
             return Self::skeleton_bar(t, id, Some(width), height, 5.0);
@@ -534,7 +534,10 @@ impl BridgeApp {
         shared.quota_loading_keys.contains(&account.key)
     }
 
-    fn account_quota_plan<'a>(&'a self, account: &'a AccountSnapshot) -> Option<&'a str> {
+    pub(super) fn account_quota_plan<'a>(
+        &'a self,
+        account: &'a AccountSnapshot,
+    ) -> Option<&'a str> {
         self.visible_quota_history
             .readings(&account.key)
             .last()
@@ -550,16 +553,7 @@ impl BridgeApp {
         title: impl Into<SharedString>,
     ) -> Div {
         let history = self.visible_quota_history.readings(&account.key);
-        let latest = history.last();
-        let windows = latest
-            .map(|latest| latest.windows.as_slice())
-            .or_else(|| {
-                account
-                    .quota
-                    .as_ref()
-                    .map(|report| report.windows.as_slice())
-            })
-            .unwrap_or_default();
+        let windows = self.account_quota_windows(account);
         let status = if loading {
             Some(if windows.is_empty() {
                 "读取中"
@@ -1191,12 +1185,7 @@ impl BridgeApp {
         cx: &mut Context<Self>,
     ) -> Div {
         let total = self.snapshot.accounts.len();
-        let healthy = self
-            .snapshot
-            .accounts
-            .iter()
-            .filter(|account| account.enabled && matches!(account.health, AccountHealth::Healthy))
-            .count();
+        let healthy = self.available_account_count();
         let primary = self
             .snapshot
             .accounts
@@ -2617,25 +2606,19 @@ impl BridgeApp {
         let effort = Self::segmented_wrap(
             t,
             "settings-effort-seg",
-            [
-                ("", "自动"),
-                ("off", "off"),
-                ("low", "low"),
-                ("medium", "medium"),
-                ("high", "high"),
-            ]
-            .into_iter()
-            .map(|(value, label)| {
-                Self::seg_item(
-                    t,
-                    format!("s-e-{label}"),
-                    label,
-                    settings.thinking_effort == value,
-                    move |this, _, _| this.set_option("thinking_effort", json!(value)),
-                    cx,
-                )
-            })
-            .collect(),
+            std::iter::once(("", "自动"))
+                .chain(THINKING_EFFORTS.iter().map(|&effort| (effort, effort)))
+                .map(|(value, label)| {
+                    Self::seg_item(
+                        t,
+                        format!("s-e-{label}"),
+                        label,
+                        settings.thinking_effort == value,
+                        move |this, _, _| this.set_option("thinking_effort", json!(value)),
+                        cx,
+                    )
+                })
+                .collect(),
         );
         let toggle_row = |title, detail, key: &'static str, current, cx: &mut Context<Self>| {
             Self::setting_row(
@@ -3243,14 +3226,16 @@ impl Render for BridgeApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = motion::begin_frame(window, cx.entity_id());
         let darkness = self.theme_amount(now);
+        let mut t = Theme::interpolated(darkness);
         if let Some((started, _)) = self.theme_transition {
+            #[cfg(target_os = "windows")]
+            super::desktop::sync_window_caption(window, darkness, &t);
             if motion::is_reduced_motion() || now.duration_since(started) >= THEME_TRANSITION {
                 self.theme_transition = None;
             } else {
                 motion::request_frame(window);
             }
         }
-        let mut t = Theme::interpolated(darkness);
         t.keyboard_focus = self.keyboard_focus;
         let shared = self.visible_state.clone();
         let width = window.viewport_size().width;
