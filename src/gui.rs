@@ -1401,10 +1401,7 @@ impl BridgeApp {
                                 } else {
                                     format!("http://{address}")
                                 };
-                                let endpoint = crate::gateway::ccswitch::endpoint_for(
-                                    crate::gateway::ccswitch::CLAUDE_DESKTOP_APP,
-                                    &base,
-                                );
+                                let endpoint = crate::gateway::claude_desktop::endpoint(&base);
                                 let profile = crate::gateway::claude_desktop::native_configuration(
                                     &endpoint,
                                     &view.pool.config().api_key,
@@ -1464,10 +1461,7 @@ impl BridgeApp {
                     let Some(path) = selection?? else {
                         return Ok(false);
                     };
-                    let endpoint = crate::gateway::ccswitch::endpoint_for(
-                        crate::gateway::ccswitch::CLAUDE_DESKTOP_APP,
-                        &view.base_url(lan),
-                    );
+                    let endpoint = crate::gateway::claude_desktop::endpoint(&view.base_url(lan));
                     crate::gateway::claude_desktop::save_native_configuration(
                         &path,
                         &endpoint,

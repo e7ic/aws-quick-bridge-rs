@@ -1,10 +1,14 @@
-//! Claude Desktop 模型发现。
+//! Claude Desktop 本地接入配置和模型发现。
 
 use crate::config::{CLAUDE_DESKTOP_AUTO_ID, CLAUDE_ROLE_MODES, model_display_name};
 use chrono::Utc;
 use serde_json::{Value, json};
 
 pub(super) const BASE_PATH: &str = "/claude-desktop";
+
+pub(crate) fn endpoint(base: &str) -> String {
+    format!("{}{BASE_PATH}", base.trim_end_matches('/'))
+}
 
 fn model_id(tier: Option<&str>) -> String {
     match tier {
@@ -13,25 +17,31 @@ fn model_id(tier: Option<&str>) -> String {
     }
 }
 
+fn model_routes(default_model: &str) -> impl Iterator<Item = (Option<&'static str>, &'static str)> {
+    let preferred = if default_model == "auto" {
+        (None, "auto")
+    } else {
+        let &(tier, mode) = CLAUDE_ROLE_MODES
+            .iter()
+            .find(|&&(_, mode)| mode == default_model)
+            .unwrap_or(&CLAUDE_ROLE_MODES[0]);
+        (Some(tier), mode)
+    };
+    std::iter::once(preferred).chain(
+        CLAUDE_ROLE_MODES
+            .iter()
+            .filter(move |&&(_, mode)| mode != preferred.1)
+            .map(|&(tier, mode)| (Some(tier), mode)),
+    )
+}
+
 #[cfg(feature = "gui")]
 pub(crate) fn native_configuration(endpoint: &str, api_key: &str, default_model: &str) -> Value {
-    let default_model = match default_model {
-        "balanced" | "fast" | "auto" => default_model,
-        _ => "smart",
-    };
-    let models: Vec<_> = std::iter::once(default_model)
-        .chain(
-            ["smart", "balanced", "fast"]
-                .into_iter()
-                .filter(|mode| *mode != default_model),
-        )
-        .map(|model| {
-            let tier = CLAUDE_ROLE_MODES
-                .iter()
-                .find_map(|&(tier, mode)| (mode == model).then_some(tier));
+    let models: Vec<_> = model_routes(default_model)
+        .map(|(tier, mode)| {
             let mut entry = json!({
                 "name": model_id(tier),
-                "labelOverride": model_display_name(model),
+                "labelOverride": model_display_name(mode),
             });
             if let Some(tier) = tier {
                 entry["anthropicFamilyTier"] = json!(tier);
@@ -45,6 +55,7 @@ pub(crate) fn native_configuration(endpoint: &str, api_key: &str, default_model:
         "inferenceGatewayBaseUrl": endpoint,
         "inferenceGatewayApiKey": api_key,
         "inferenceGatewayAuthScheme": "bearer",
+        "modelDiscoveryEnabled": true,
         "inferenceModels": models,
     })
 }
@@ -68,16 +79,9 @@ pub(crate) fn save_native_configuration(
     Ok(())
 }
 
-pub(super) fn list_models(include_auto: bool) -> Vec<Value> {
+pub(super) fn list_models(default_model: &str) -> Vec<Value> {
     let created_at = Utc::now().to_rfc3339();
-    include_auto
-        .then_some((None, "auto"))
-        .into_iter()
-        .chain(
-            CLAUDE_ROLE_MODES
-                .iter()
-                .map(|&(tier, mode)| (Some(tier), mode)),
-        )
+    model_routes(default_model)
         .map(|(tier, mode)| {
             let mut entry = json!({
                 "type": "model",
@@ -101,7 +105,7 @@ mod tests {
 
     #[test]
     fn resolves_desktop_ids_and_tier_aliases_to_quick_modes() {
-        for (model, &(_, mode)) in list_models(false).iter().zip(CLAUDE_ROLE_MODES) {
+        for (model, &(_, mode)) in list_models("smart").iter().zip(CLAUDE_ROLE_MODES) {
             assert_eq!(
                 resolve_quick_model(model["id"].as_str().unwrap()),
                 Some(mode)
@@ -136,17 +140,15 @@ mod tests {
             assert_eq!(config["inferenceGatewayBaseUrl"], endpoint);
             assert_eq!(config["inferenceGatewayApiKey"], "test-key");
             assert_eq!(config["inferenceGatewayAuthScheme"], "bearer");
+            assert_eq!(config["modelDiscoveryEnabled"], true);
             let configured = config["inferenceModels"].as_array().unwrap();
-            let advertised = list_models(mode == "auto");
+            let advertised = list_models(mode);
             assert_eq!(configured.len(), advertised.len());
             assert_eq!(configured[0]["name"], id);
             assert_eq!(configured[0]["labelOverride"], model_display_name(mode));
 
-            for model in configured {
-                let route = advertised
-                    .iter()
-                    .find(|entry| entry["id"] == model["name"])
-                    .expect("every configured model must be advertised by the Desktop gateway");
+            for (model, route) in configured.iter().zip(&advertised) {
+                assert_eq!(model["name"], route["id"]);
                 assert_eq!(model["labelOverride"], route["display_name"]);
                 assert_eq!(model["anthropicFamilyTier"], route["anthropic_family_tier"]);
                 assert!(model.get("behavesAs").is_none());

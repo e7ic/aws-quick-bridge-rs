@@ -53,7 +53,7 @@ Rust 重写的 Amazon Quick（QuickWork）多协议桥接器，内置自主实�
 
 模型选择器显示 Quick Smart、Quick Balanced 和 Quick Fast。默认挡位为 Auto 时，也会列出 Quick Auto。每次请求实际使用的模型以日志为准。
 
-一键接入与导出配置使用 Desktop 模型发现接口提供的路由 ID。已有 Quick Bridge 配置可在客户端卡片上点「更新接入」。[模型列表设置](https://claude.com/docs/third-party/claude-desktop/models#model-list-and-default-model)
+一键接入与导出配置会开启模型发现，并和 Quick Bridge 网关的 `/claude-desktop/v1/models` 使用同一份模型列表及默认档位。Quick Bridge 收到请求后会按路由选择 Quick 档位并转发给 Amazon Quick。已有 Quick Bridge 配置可在客户端卡片上点「更新接入」。[模型列表设置](https://claude.com/docs/third-party/claude-desktop/models#model-list-and-default-model)
 
 ### 使用 CC Switch 导入 Claude Desktop
 

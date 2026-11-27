@@ -42,7 +42,10 @@ async fn quick_turn(
         let input = &msg["payload"];
         let text = input["text"].as_str().unwrap();
         turns.send((account.clone(), input.clone())).unwrap();
-        if text.contains("wait for cancellation") {
+        // A non-streaming probe will run out of time if it inherits full reasoning.
+        if text.contains("wait for cancellation")
+            || (text == "." && input["thinking_effort"] != "off")
+        {
             send(&mut ws, "text_delta", json!({"text":"stream started"})).await;
             while let Some(event) = receive(&mut ws).await {
                 if event["type"] == "stop_generation" {
@@ -210,16 +213,14 @@ async fn check_desktop_tool_bridge(
         {"name":"private_tool","allowed_callers":["code_execution_20260120"],"input_schema":{"type":"object"}}
     ]);
     let request = |prompt: &str, stream: bool, tools: &Value| {
-        client
-            .post(format!(
-                "http://{}/claude-desktop/v1/messages",
-                gateway.addr
-            ))
-            .bearer_auth(SIGN_IN)
-            .json(&json!({
+        desktop_request(
+            client,
+            gateway,
+            json!({
                 "model":"claude-opus-bridge", "stream":stream, "max_tokens":128,
                 "tools":tools, "messages":[{"role":"user","content":prompt}]
-            }))
+            }),
+        )
     };
 
     for stream in [false, true] {
@@ -265,6 +266,7 @@ async fn check_desktop_tool_bridge(
             assert_eq!(response["stop_reason"], "tool_use");
         }
         let (_, sent) = turns.recv().await.unwrap();
+        assert_eq!(sent["thinking_effort"], "high");
         assert!(
             !sent["custom_prompt"]
                 .as_str()
@@ -308,6 +310,20 @@ async fn check_desktop_tool_bridge(
     assert!(!invalid.contains("event: message_stop"));
 }
 
+fn desktop_request(
+    client: &reqwest::Client,
+    gateway: &RunningServer,
+    body: Value,
+) -> reqwest::RequestBuilder {
+    client
+        .post(format!(
+            "http://{}/claude-desktop/v1/messages",
+            gateway.addr
+        ))
+        .bearer_auth(SIGN_IN)
+        .json(&body)
+}
+
 #[tokio::test]
 async fn resumes_after_restart_fails_over_on_quota_and_stops_on_disconnect() {
     let dir = tempfile::tempdir().unwrap();
@@ -335,7 +351,10 @@ async fn resumes_after_restart_fails_over_on_quota_and_stops_on_disconnect() {
         api_key: SIGN_IN.into(),
         port: 0,
         host: "127.0.0.1".into(),
-        options: serde_json::from_value(json!({"header_wait":"off","stateful":true})).unwrap(),
+        options: serde_json::from_value(json!({
+            "header_wait":"off", "stateful":true, "thinking_effort":"high"
+        }))
+        .unwrap(),
     })
     .unwrap();
     let primary = account("a", quick_port, usage_port);
@@ -350,6 +369,44 @@ async fn resumes_after_restart_fails_over_on_quota_and_stops_on_disconnect() {
         .build()
         .unwrap();
     let first = gateway(AccountPool::load().unwrap()).await;
+    let models: Value = client
+        .get(format!("http://{}/claude-desktop/v1/models", first.addr))
+        .bearer_auth(SIGN_IN)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let probe_model = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["anthropic_family_tier"] == "haiku")
+        .unwrap();
+    let probe: Value = desktop_request(
+        &client,
+        &first,
+        json!({
+            "model":probe_model["id"], "max_tokens":1,
+            "messages":[{"role":"user","content":"."}]
+        }),
+    )
+    .timeout(Duration::from_secs(3))
+    .send()
+    .await
+    .expect("the one-token Desktop connection probe should complete before the client timeout")
+    .error_for_status()
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+    let (_, probe_turn) = turns.recv().await.unwrap();
+    assert_eq!(probe_turn["agent_mode"], "fast");
+    assert_eq!(probe_turn["thinking_effort"], "off");
+    assert_eq!(probe["content"][0]["text"], "fixture answer");
     check_desktop_tool_bridge(&client, &first, &mut turns).await;
     request(
         &client,
@@ -463,11 +520,13 @@ async fn resumes_after_restart_fails_over_on_quota_and_stops_on_disconnect() {
     let fallback = turns.try_recv().ok();
     let primary_health = pool.snapshot().accounts[0].health.clone();
 
-    let mut streaming = request(
+    let mut streaming = desktop_request(
         &client,
         &running,
-        json!([{"role":"user","content":"wait for cancellation"}]),
-        true,
+        json!({
+            "model":"claude-haiku-bridge", "stream":true, "max_tokens":128,
+            "messages":[{"role":"user","content":"wait for cancellation"}]
+        }),
     )
     .send()
     .await
@@ -485,7 +544,7 @@ async fn resumes_after_restart_fails_over_on_quota_and_stops_on_disconnect() {
         .await
         .ok()
         .flatten();
-    wait_for_log(&pool, "chat", 499, 1).await;
+    wait_for_log(&pool, "messages", 499, 1).await;
 
     let pending = request(
         &client,
@@ -503,12 +562,12 @@ async fn resumes_after_restart_fails_over_on_quota_and_stops_on_disconnect() {
         stopped_before_headers,
         Some(before_headers["thread_id"].clone())
     );
-    wait_for_log(&pool, "chat", 499, 2).await;
+    wait_for_log(&pool, "chat", 499, 1).await;
     for entry in pool
         .snapshot()
         .logs
         .iter()
-        .filter(|entry| entry.api == "chat" && entry.status == 499)
+        .filter(|entry| entry.status == 499)
     {
         let context = entry.context.unwrap();
         assert_eq!(context.used_tokens, Some(75));

@@ -47,9 +47,7 @@ pub fn find_app(app: &str) -> Option<AppSpec> {
 pub fn endpoint_for(app: &str, base: &str) -> String {
     let trimmed = base.trim_end_matches('/');
     match find_app(app) {
-        Some(spec) if spec.key == CLAUDE_DESKTOP_APP => {
-            format!("{trimmed}{}", super::claude_desktop::BASE_PATH)
-        }
+        Some(spec) if spec.key == CLAUDE_DESKTOP_APP => super::claude_desktop::endpoint(trimmed),
         Some(spec) if spec.v1 => format!("{trimmed}/v1"),
         _ => trimmed.to_string(),
     }

@@ -32,9 +32,9 @@ pub(crate) fn normalize_thinking_effort(value: &str) -> Option<&'static str> {
     }
 }
 
-// 客户端协议角色与网关档位的对应关系。
+// 客户端协议角色按 Quick Smart、Balanced、Fast 的顺序发布。
 pub(crate) const CLAUDE_ROLE_MODES: &[(&str, &str)] =
-    &[("sonnet", "balanced"), ("opus", "smart"), ("haiku", "fast")];
+    &[("opus", "smart"), ("sonnet", "balanced"), ("haiku", "fast")];
 pub(crate) const CLAUDE_DESKTOP_AUTO_ID: &str = "claude-auto-bridge";
 
 pub fn model_display_name(id: &str) -> String {

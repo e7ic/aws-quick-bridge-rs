@@ -1,6 +1,6 @@
 [package]
 name = "aws-quick-bridge-rs"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 default-run = "aws-quick-bridge-rs"
 description = "Rust implementation of Amazon Quick (QuickWork) bridge with Magpie-style multi-account pool, Anthropic/OpenAI gateway, CC Switch integration, and GPUI desktop app."
@@ -89,3 +89,4 @@ embed-resource = { version = "3.0.12", optional = true }
 image = { version = "0.25", default-features = false, features = ["ico"] }
 resvg = { version = "0.45", default-features = false }
 tempfile = "3.27"
+tokio = { version = "1.54", features = ["test-util"] }

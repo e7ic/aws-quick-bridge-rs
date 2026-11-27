@@ -458,7 +458,16 @@ async fn execute_request(
         );
     }
 
-    let cfg = pool.settings();
+    let mut cfg = pool.settings();
+    if desktop
+        && body["max_tokens"].as_u64() == Some(1)
+        && body["stream"].as_bool() != Some(true)
+        && body["thinking"].is_null()
+    {
+        // Desktop's connection probe has a one-token budget and a short deadline.
+        // A client-specified effort still takes precedence over this default.
+        cfg.thinking_effort = "off".into();
+    }
     let (mut chat_body, mut conversation, anthropic_req, responses_req) = match api {
         ApiKind::Messages => {
             let req = anthropic::to_chat(&body);
@@ -810,9 +819,9 @@ async fn dispatch(
     }
 
     match (method.clone(), path.as_str()) {
-        (Method::GET, "/models") if desktop => models_response(claude_desktop::list_models(
-            pool.settings().default_model == "auto",
-        )),
+        (Method::GET, "/models") if desktop => {
+            models_response(claude_desktop::list_models(&pool.settings().default_model))
+        }
         (Method::GET, "/models") => handle_models(&pool).await,
         (Method::POST, "/chat/completions") if !desktop => {
             execute_with_pool(pool, ApiKind::Chat, headers, body, false).await

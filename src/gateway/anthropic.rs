@@ -2,11 +2,13 @@
 
 use crate::chat::{ChatFailure, ChatOutput, NormalizedUsage, TurnEvent};
 use crate::messages::agent_neutral;
-use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use bytes::Bytes;
-use futures_util::StreamExt;
+use axum::http::{HeaderName, StatusCode, header};
+use axum::response::{
+    IntoResponse, Response,
+    sse::{Event, KeepAlive, Sse},
+};
 use serde_json::{Value, json};
+use std::{convert::Infallible, time::Duration};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
@@ -436,14 +438,14 @@ pub fn from_chat_output(
             .into_response()
         }
         ChatOutput::Stream(mut started) => {
-            let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+            let (tx, rx) = mpsc::unbounded_channel::<Result<Event, Infallible>>();
+            let ping = Event::default().event("ping").data(r#"{"type":"ping"}"#);
+            let keep_alive = KeepAlive::new()
+                .interval(Duration::from_secs(10))
+                .event(ping.clone());
             tokio::spawn(async move {
                 let send = |event: &str, data: &Value| {
-                    let frame = format!(
-                        "event: {event}\ndata: {}\n\n",
-                        serde_json::to_string(data).unwrap_or_default()
-                    );
-                    let _ = tx.send(Ok(Bytes::from(frame)));
+                    let _ = tx.send(Ok(Event::default().event(event).data(data.to_string())));
                 };
 
                 send(
@@ -462,7 +464,7 @@ pub fn from_chat_output(
                         }
                     }),
                 );
-                send("ping", &json!({ "type": "ping" }));
+                let _ = tx.send(Ok(ping));
 
                 let mut index: i32 = -1;
                 let mut open: &'static str = "";
@@ -575,14 +577,70 @@ pub fn from_chat_output(
                 on_done(outcome);
             });
 
-            let stream = UnboundedReceiverStream::new(rx).boxed();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .header("x-accel-buffering", "no")
-                .body(axum::body::Body::from_stream(stream))
-                .unwrap()
+            (
+                [
+                    (header::CONTENT_TYPE, "text/event-stream; charset=utf-8"),
+                    (HeaderName::from_static("x-accel-buffering"), "no"),
+                ],
+                Sse::new(UnboundedReceiverStream::new(rx)).keep_alive(keep_alive),
+            )
+                .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::StartedStream;
+    use futures_util::StreamExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_keeps_the_client_connected_until_output_arrives() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (done, outcome) = tokio::sync::oneshot::channel();
+        let request = to_chat(&json!({"model": "claude-opus-bridge", "stream": true}));
+        let stream = ChatOutput::Stream(StartedStream {
+            id: "fixture".into(),
+            created: 0,
+            model: "smart".into(),
+            include_usage: true,
+            rx,
+        });
+        let mut body = from_chat_output(stream, &request, move |result| {
+            done.send(result).unwrap();
+        })
+        .into_body()
+        .into_data_stream();
+
+        let next = async |body: &mut axum::body::BodyDataStream| {
+            // A client gives up if no bytes arrive within its read budget.
+            tokio::time::timeout(Duration::from_secs(12), body.next())
+                .await
+                .expect("the gateway let the SSE connection go idle")
+                .expect("the gateway closed the stream")
+                .unwrap()
+        };
+        assert!(next(&mut body).await.starts_with(b"event: message_start"));
+        for _ in 0..3 {
+            tx.send(TurnEvent::Reasoning("hidden reasoning".into()))
+                .unwrap();
+            assert_eq!(
+                next(&mut body).await,
+                "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+            );
+        }
+
+        tx.send(TurnEvent::Text("Ready".into())).unwrap();
+        tx.send(TurnEvent::Done(NormalizedUsage::default()))
+            .unwrap();
+        let mut remainder = Vec::new();
+        while let Some(frame) = body.next().await {
+            remainder.extend(frame.unwrap());
+        }
+        let remainder = String::from_utf8(remainder).unwrap();
+        assert!(remainder.contains("Ready"));
+        assert!(remainder.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        assert!(outcome.await.unwrap().is_ok());
     }
 }

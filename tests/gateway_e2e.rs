@@ -156,18 +156,18 @@ async fn test_gateway_http_routes_and_pool_failover() {
     assert_eq!(listed.len(), 3);
     for (model, (id, display_name, tier, versioned_id, legacy_id)) in listed.iter().zip([
         (
-            "claude-sonnet-bridge",
-            "Quick Balanced",
-            "sonnet",
-            "claude-sonnet-5-5",
-            "claude-sonnet-quick-balanced",
-        ),
-        (
             "claude-opus-bridge",
             "Quick Smart",
             "opus",
             "claude-opus-5",
             "claude-opus-quick-smart",
+        ),
+        (
+            "claude-sonnet-bridge",
+            "Quick Balanced",
+            "sonnet",
+            "claude-sonnet-5-5",
+            "claude-sonnet-quick-balanced",
         ),
         (
             "claude-haiku-bridge",
