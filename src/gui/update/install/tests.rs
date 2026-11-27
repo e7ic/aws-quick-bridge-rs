@@ -68,8 +68,11 @@ fn windows_install_recovers_both_binaries_after_a_failed_restart() -> Result<()>
     }
     fs::write(installed.path().join("user-file.txt"), b"user data")?;
     let archive = incoming.path().join("package.zip");
-    let zipped = powershell()?
-        .arg("$ErrorActionPreference = 'Stop'; Compress-Archive -LiteralPath $env:QUICK_BRIDGE_UPDATE_SOURCE -DestinationPath $env:QUICK_BRIDGE_UPDATE_ARCHIVE")
+    let system_root = PathBuf::from(std::env::var_os("SystemRoot").context("locate Windows")?);
+    let powershell = system_root.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let zipped = background_command(powershell)
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg("$ErrorActionPreference = 'Stop'; Compress-Archive -Path $env:QUICK_BRIDGE_UPDATE_SOURCE -DestinationPath $env:QUICK_BRIDGE_UPDATE_ARCHIVE -CompressionLevel Optimal")
         .env("QUICK_BRIDGE_UPDATE_SOURCE", package)
         .env("QUICK_BRIDGE_UPDATE_ARCHIVE", &archive)
         .status()?;
@@ -81,7 +84,11 @@ fn windows_install_recovers_both_binaries_after_a_failed_restart() -> Result<()>
         .read(true)
         .share_mode(1) // FILE_SHARE_READ
         .open(installed.path().join(GUI_EXE))?;
-    assert!(apply_package(&location, &archive, &version, || Ok(())).is_err());
+    let blocked = apply_package(&location, &archive, &version, || Ok(())).unwrap_err();
+    assert!(
+        blocked.to_string().starts_with("替换更新失败"),
+        "{blocked:#}"
+    );
     assert_eq!(fs::read(installed.path().join(CLI_EXE))?, b"old");
     drop(locked);
 

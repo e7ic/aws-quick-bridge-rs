@@ -363,16 +363,6 @@ fn apply_package(
 }
 
 #[cfg(target_os = "windows")]
-fn powershell() -> Result<Command> {
-    let windows =
-        PathBuf::from(std::env::var_os("SystemRoot").context("无法定位 Windows 系统目录")?);
-    let executable = windows.join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-    let mut command = background_command(executable);
-    command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]);
-    Ok(command)
-}
-
-#[cfg(target_os = "windows")]
 fn apply_package(
     location: &InstallLocation,
     archive: &Path,
@@ -380,14 +370,8 @@ fn apply_package(
     after_install: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let staging = location.staging_dir()?;
-    let status = powershell()?
-        .arg("$ErrorActionPreference = 'Stop'; Expand-Archive -LiteralPath $env:QUICK_BRIDGE_UPDATE_ARCHIVE -DestinationPath $env:QUICK_BRIDGE_UPDATE_DIRECTORY")
-        .env("QUICK_BRIDGE_UPDATE_ARCHIVE", archive)
-        .env("QUICK_BRIDGE_UPDATE_DIRECTORY", staging.path())
-        .status()
-        .context("无法解压 Windows 更新包")?;
-    ensure!(status.success(), "解压 Windows 更新包失败");
-    let extracted = staging.path().join("Quick Bridge");
+    let mut archive =
+        zip::ZipArchive::new(File::open(archive)?).context("无法读取 Windows 更新包")?;
     let cli = location.executable.with_file_name(CLI_EXE);
     let backup = staging.path().join("backup");
     fs::create_dir(&backup)?;
@@ -397,11 +381,12 @@ fn apply_package(
         (CLI_EXE, cli.as_path()),
         (GUI_EXE, location.executable.as_path()),
     ] {
-        let update = extracted.join(name);
-        ensure!(
-            fs::symlink_metadata(&update)?.is_file(),
-            "Windows 更新包缺少 {name}"
-        );
+        let index = archive
+            .index_for_name(&format!("Quick Bridge/{name}"))
+            .or_else(|| archive.index_for_name(&format!(r"Quick Bridge\{name}")))
+            .with_context(|| format!("Windows 更新包缺少 {name}"))?;
+        let mut entry = archive.by_index(index)?;
+        ensure!(entry.is_file(), "Windows 更新包中的 {name} 不是程序文件");
         if name == CLI_EXE && !installed.try_exists()? {
             continue;
         }
@@ -409,6 +394,9 @@ fn apply_package(
             fs::symlink_metadata(installed)?.is_file(),
             "无法识别已安装的 {name}"
         );
+        let update = staging.path().join(name);
+        std::io::copy(&mut entry, &mut File::create_new(&update)?)
+            .with_context(|| format!("无法解压 {name}"))?;
         let backup = backup.join(name);
         fs::copy(installed, &backup).with_context(|| format!("备份 {name} 失败"))?;
         files.push((update, installed, backup));
