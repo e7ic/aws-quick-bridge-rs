@@ -1,4 +1,11 @@
-# aws-quick-bridge-rs
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo-light.svg" width="96" alt="Quick Birdge Logo">
+  </picture>
+</p>
+
+<h1 align="center">Quick Birdge</h1>
 
 Rust 重写的 Amazon Quick（QuickWork）多协议桥接器，内置自主实现的类 Magpie 多账号池调度与跨平台 GPUI 原生桌面界面（支持 **macOS** 与 **Windows**，内置 **MiSans** 字体）。
 
