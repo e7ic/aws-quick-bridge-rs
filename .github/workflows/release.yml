@@ -69,6 +69,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - name: Read annotated release notes
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          : > release-notes.md
+          if [ "$(git cat-file -t "$GITHUB_REF")" = tag ]; then
+            git for-each-ref --format='%(contents:subject)%0a%0a%(contents:body)' "$GITHUB_REF" > release-notes.md
+          fi
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
@@ -77,12 +86,6 @@ jobs:
         env:
           QUICK_BRIDGE_UPDATE_PRIVATE_KEY: ${{ secrets.QUICK_BRIDGE_UPDATE_PRIVATE_KEY }}
         run: python3 scripts/sign-update.py "$GITHUB_REF_NAME" release-assets
-      - name: Read annotated release notes
-        run: |
-          : > release-notes.md
-          if [ "$(git cat-file -t "$GITHUB_REF")" = tag ]; then
-            git for-each-ref --format='%(contents:subject)%0a%0a%(contents:body)' "$GITHUB_REF" > release-notes.md
-          fi
       - uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
