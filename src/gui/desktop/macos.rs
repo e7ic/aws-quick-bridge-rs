@@ -147,7 +147,17 @@ pub(in crate::gui) fn configure_application(cx: &mut App) {
     });
     cx.on_action(|_: &ShowWindow, cx| cx.defer(show_window));
     cx.on_action(|_: &HideWindow, cx| cx.defer(hide_focused_window));
-    cx.on_action(|_: &QuitApplication, cx| cx.quit());
+    cx.on_action(|_: &QuitApplication, cx| {
+        let window = cx.global::<MacDesktop>().main_window;
+        if let Some(window) = window
+            && window
+                .update(cx, |view, _, cx| view.request_quit(cx))
+                .is_ok()
+        {
+            return;
+        }
+        cx.quit();
+    });
     cx.bind_keys([
         KeyBinding::new("cmd-w", HideWindow, None),
         KeyBinding::new("cmd-q", QuitApplication, None),

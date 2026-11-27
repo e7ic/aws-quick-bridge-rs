@@ -13,7 +13,9 @@ pub(super) use macos::{
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub(super) use windows::{keep_window_in_background, prefers_reduced_motion, sync_window_caption};
+pub(super) use windows::{
+    keep_window_in_background, prefers_reduced_motion, sync_window_caption, take_quit_request,
+};
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(super) fn prefers_reduced_motion() -> bool {

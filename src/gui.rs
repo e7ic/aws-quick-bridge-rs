@@ -11,6 +11,8 @@ mod motion;
 mod quota_history;
 mod tables;
 mod toasts;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod update;
 mod usage;
 mod view;
 
@@ -493,6 +495,8 @@ struct BridgeApp {
     shared: Arc<Mutex<GuiShared>>,
     ui_rev: Arc<AtomicU64>,
     visible_state: GuiShared,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    updates: Option<update::Updates>,
     snapshot: PoolSnapshot,
     account_card_highlight: activity::AccountCardHighlight,
     account_activity: HashMap<String, activity::AccountActivity>,
@@ -625,6 +629,12 @@ impl BridgeApp {
                 let now = Instant::now();
                 let second_elapsed = now.duration_since(last_tick) >= Duration::from_secs(1);
                 let ok = this.update(cx, |view, cx| {
+                    #[cfg(target_os = "windows")]
+                    if desktop::take_quit_request() {
+                        view.request_quit(cx);
+                    }
+                    #[cfg(any(target_os = "macos", target_os = "windows"))]
+                    view.start_waiting_update(cx);
                     let mut dirty = cur_rev != last_rev || view.account_card_highlight.expired(now);
                     if view
                         .account_menu
@@ -720,6 +730,8 @@ impl BridgeApp {
             shared,
             ui_rev,
             visible_state: init_shared,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            updates: update::Updates::for_current_install(),
             snapshot,
             account_card_highlight: activity::AccountCardHighlight::default(),
             account_activity,
@@ -756,6 +768,17 @@ impl BridgeApp {
 
     fn bump_ui(&self) {
         self.ui_rev.fetch_add(1, Ordering::Release);
+    }
+
+    fn request_quit(&mut self, cx: &mut Context<Self>) {
+        if self.pending_action == Some(PendingAction::Quit) {
+            self.pending_action = None;
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if self.install_update_on_quit(cx) {
+            return;
+        }
+        cx.quit();
     }
 
     fn theme_amount(&self, now: Instant) -> f32 {
@@ -1475,6 +1498,10 @@ impl BridgeApp {
 
 /// 启动原生 GPUI 桌面窗口并注册 SVG 资产源与 MiSans 字体。
 pub fn run_gui() -> Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let Some(startup) = update::startup()? else {
+        return Ok(());
+    };
     let fonts = load_misans_fonts()?;
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
@@ -1529,6 +1556,15 @@ pub fn run_gui() -> Result<()> {
         #[cfg(target_os = "macos")]
         desktop::set_main_window(cx, _main_window);
         cx.activate(true);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            if let Err(error) = startup.acknowledge() {
+                eprintln!("Quick Bridge could not acknowledge the update: {error:#}");
+                cx.quit();
+                return;
+            }
+            let _ = _main_window.update(cx, |view, _, cx| view.initialize_updates(&startup, cx));
+        }
     });
     Ok(())
 }

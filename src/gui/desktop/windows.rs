@@ -6,6 +6,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::mem::size_of;
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::{
     Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
     Graphics::Gdi::{COLOR_WINDOW, GetSysColor},
@@ -25,12 +26,11 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, IDI_APPLICATION,
             IsIconic, IsWindowVisible, LoadIconW, MF_SEPARATOR, MF_STRING, PostMessageW,
-            PostQuitMessage, RegisterWindowMessageW, SPI_GETCLIENTAREAANIMATION,
-            SPI_GETHIGHCONTRAST, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
-            SystemParametersInfoW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
-            WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP,
-            WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE,
-            WM_THEMECHANGED,
+            RegisterWindowMessageW, SPI_GETCLIENTAREAANIMATION, SPI_GETHIGHCONTRAST, SW_HIDE,
+            SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow, SystemParametersInfoW,
+            TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_APP, WM_CLOSE,
+            WM_CONTEXTMENU, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONUP, WM_NCDESTROY, WM_NULL,
+            WM_RBUTTONUP, WM_SETTINGCHANGE, WM_SYSCOLORCHANGE, WM_THEMECHANGED,
         },
     },
 };
@@ -47,6 +47,11 @@ const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
 const LEGACY_TRAY: usize = 1;
 const TRAY_V4: usize = NOTIFYICON_VERSION_4 as usize;
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub(in crate::gui) fn take_quit_request() -> bool {
+    QUIT_REQUESTED.swap(false, Ordering::Relaxed)
+}
 
 pub(in crate::gui) fn prefers_reduced_motion() -> bool {
     let mut enabled: i32 = 1;
@@ -277,8 +282,7 @@ unsafe extern "system" fn tray_window_proc(
                 (true, NIN_SELECT | NIN_KEYSELECT) | (false, WM_LBUTTONUP) => show_panel(hwnd),
                 (true, WM_CONTEXTMENU) | (false, WM_RBUTTONUP) => match tray_menu(hwnd) {
                     OPEN_PANEL => show_panel(hwnd),
-                    // SAFETY: WM_QUIT 发送到 GPUI 的 Windows 主消息循环，触发应用退出回调。
-                    QUIT_APP => unsafe { PostQuitMessage(0) },
+                    QUIT_APP => QUIT_REQUESTED.store(true, Ordering::Relaxed),
                     _ => {
                         unsafe { Shell_NotifyIconW(NIM_SETFOCUS, &icon_data(hwnd)) };
                     }

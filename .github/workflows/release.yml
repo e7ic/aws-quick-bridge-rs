@@ -10,6 +10,9 @@ on:
 permissions:
   contents: write
 
+env:
+  QUICK_BRIDGE_UPDATE_PUBLIC_KEY: ${{ vars.QUICK_BRIDGE_UPDATE_PUBLIC_KEY }}
+
 concurrency:
   group: package-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -65,11 +68,23 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
+      - name: Sign desktop update manifest
+        env:
+          QUICK_BRIDGE_UPDATE_PRIVATE_KEY: ${{ secrets.QUICK_BRIDGE_UPDATE_PRIVATE_KEY }}
+        run: python3 scripts/sign-update.py "$GITHUB_REF_NAME" release-assets
+      - name: Read annotated release notes
+        run: |
+          : > release-notes.md
+          if [ "$(git cat-file -t "$GITHUB_REF")" = tag ]; then
+            git for-each-ref --format='%(contents:subject)%0a%0a%(contents:body)' "$GITHUB_REF" > release-notes.md
+          fi
       - uses: softprops/action-gh-release@v2
         with:
           files: release-assets/*
+          body_path: release-notes.md
           generate_release_notes: true

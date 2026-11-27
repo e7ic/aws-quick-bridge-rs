@@ -516,7 +516,12 @@ impl MenuPanel {
                         false,
                         "确认退出",
                         BtnVariant::SoftDanger,
-                        |_, _, cx| cx.quit(),
+                        |panel: &mut Self, _, cx| {
+                            panel
+                                .bridge
+                                .update(cx, |bridge, cx| bridge.request_quit(cx));
+                            panel.confirm_quit = false;
+                        },
                         cx,
                     )),
             );
@@ -531,7 +536,9 @@ impl MenuPanel {
                 BtnVariant::Text(t.text_muted),
                 |panel: &mut Self, _, cx| {
                     if panel.bridge.read(cx).shared.lock().listener_editable() {
-                        cx.quit();
+                        panel
+                            .bridge
+                            .update(cx, |bridge, cx| bridge.request_quit(cx));
                     } else {
                         panel.confirm_quit = true;
                     }

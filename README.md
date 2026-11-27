@@ -63,6 +63,18 @@ Rust 重写的 Amazon Quick（QuickWork）多协议桥接器，内置自主实�
 
 也可通过 `cargo run --release -- ccswitch --app claude-desktop --open` 打开导入链接。
 
+## 桌面自动更新
+
+首个支持自动更新的正式版需要手动安装一次。此后应用在启动和后台运行时自动从 GitHub Releases 检查并下载适用的安装包。在「设置 → 应用 → 软件更新」可手动检查。下载完成后，可以选择「重启更新」，也可以在退出应用时安装。重启更新会等网关请求结束，更新后恢复更新前的网关运行状态。
+
+发布时，GitHub Actions 用 Ed25519 给更新清单签名。初次启用时请在仓库外生成并备份签名密钥。将 PEM 私钥设为 Actions Secret `QUICK_BRIDGE_UPDATE_PRIVATE_KEY`，将最后一条命令输出的公钥设为 Actions Variable `QUICK_BRIDGE_UPDATE_PUBLIC_KEY`。后续版本沿用同一密钥签名，让已安装版本持续验证更新。
+
+```sh
+umask 077
+openssl genpkey -algorithm Ed25519 -out quick-bridge-update.pem
+openssl pkey -in quick-bridge-update.pem -pubout -outform DER | tail -c 32 | openssl base64 -A
+```
+
 ## 构建与运行
 
 ### macOS

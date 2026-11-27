@@ -488,6 +488,19 @@ impl AccountPool {
         self.usage_stats.save();
     }
 
+    #[cfg(all(feature = "gui", any(target_os = "macos", target_os = "windows")))]
+    pub(crate) fn requests_idle(&self) -> bool {
+        self.accounts.read().in_flight.is_empty()
+    }
+
+    #[cfg(all(feature = "gui", any(target_os = "macos", target_os = "windows")))]
+    pub(crate) async fn wait_for_request_idle(&self) {
+        let mut events = self.subscribe();
+        while !self.requests_idle() {
+            let _ = events.recv().await;
+        }
+    }
+
     #[cfg(feature = "gui")]
     pub(crate) fn usage_history(&self) -> Arc<UsageHistory> {
         self.usage_stats.snapshot()
@@ -1178,6 +1191,36 @@ mod tests {
         assert_eq!(totals.calls, 2);
         assert_eq!(totals.tokens(), 175);
         assert_eq!(totals.cache_read, 65);
+    }
+
+    #[cfg(all(feature = "gui", any(target_os = "macos", target_os = "windows")))]
+    #[tokio::test]
+    async fn updater_waits_until_the_last_reserved_request_has_released() {
+        let directory = tempfile::tempdir().unwrap();
+        let account: AccountRecord = serde_json::from_value(json!({
+            "accountId": "fixture",
+            "tenantUrl": "https://example.test",
+            "access": "fixture-token"
+        }))
+        .unwrap();
+        let pool = Arc::new(AccountPool::new(
+            BridgeConfig::default(),
+            AccountsFile {
+                primary_key: account.key(),
+                accounts: vec![account],
+            },
+            directory.path(),
+        ));
+        let (_, request) = pool.reserve_request("turn", &HashSet::new(), None).unwrap();
+        assert!(!pool.requests_idle());
+        let wait = pool.wait_for_request_idle();
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        drop(request);
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap();
+        assert!(pool.requests_idle());
     }
 
     #[test]

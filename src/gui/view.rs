@@ -2492,10 +2492,10 @@ impl BridgeApp {
         )
     }
 
-    fn setting_row(
+    pub(super) fn setting_row(
         t: Theme,
         title: &'static str,
-        detail: &'static str,
+        detail: impl Into<SharedString>,
         control: AnyElement,
     ) -> impl IntoElement {
         motion::layout(
@@ -2526,7 +2526,7 @@ impl BridgeApp {
                             div()
                                 .text_size(px(11.5))
                                 .text_color(t.text_muted)
-                                .child(detail),
+                                .child(detail.into()),
                         ),
                 )
                 .child(
@@ -2544,6 +2544,10 @@ impl BridgeApp {
     fn render_settings(&self, t: Theme, shared: &GuiShared, cx: &mut Context<Self>) -> Div {
         let config = &self.snapshot.config;
         let settings = Settings::from_options(&config.options);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let software_update = Some(self.software_update_row(t, cx));
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let software_update = None::<AnyElement>;
 
         let listener_editable = shared.listener_editable();
         let confirming_quit = self.pending_action == Some(PendingAction::Quit);
@@ -2744,6 +2748,7 @@ impl BridgeApp {
                     .flex()
                     .flex_col()
                     .child(Self::section_header(t, "应用"))
+                    .children(software_update)
                     .child(Self::setting_row(
                         t,
                         "关闭窗口行为",
@@ -2792,7 +2797,7 @@ impl BridgeApp {
                                     if this.pending_action == Some(PendingAction::Quit) {
                                         this.pending_action = None;
                                     } else if this.shared.lock().listener_editable() {
-                                        cx.quit();
+                                        this.request_quit(cx);
                                     } else {
                                         this.toggle_action(PendingAction::Quit);
                                     }
@@ -2807,7 +2812,7 @@ impl BridgeApp {
                                     false,
                                     "确认退出",
                                     BtnVariant::SoftDanger,
-                                    |_, _, cx| cx.quit(),
+                                    |this, _, cx| this.request_quit(cx),
                                     cx,
                                 ))
                             })
