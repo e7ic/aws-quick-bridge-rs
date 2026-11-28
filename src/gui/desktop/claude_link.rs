@@ -187,6 +187,8 @@ impl LinkFiles {
         meta.value.insert(APPLIED.into(), json!(PROFILE_ID));
         normal.value.insert(MODE.into(), json!("3p"));
         third_party.value.insert(MODE.into(), json!("3p"));
+        // A configured model list overrides capabilities discovered from the gateway.
+        owned.value.remove("inferenceModels");
         owned
             .value
             .extend(profile.as_object().context("直连配置格式无效")?.clone());
@@ -405,8 +407,11 @@ mod tests {
         );
         let original_profile = fs::read(&other_profile).unwrap();
 
-        let mut first =
-            native_configuration("http://127.0.0.1:18765/claude-desktop", "test-key", "fast");
+        let mut first = native_configuration("http://127.0.0.1:18765/claude-desktop", "test-key");
+        first
+            .as_object_mut()
+            .unwrap()
+            .remove("modelPrefer1mContext");
         first["inferenceModels"] = json!([
             {"name": "fast", "labelOverride": "Quick Fast"},
             {"name": "smart", "labelOverride": "Quick Smart"},
@@ -426,11 +431,7 @@ mod tests {
                 .contains("test-key")
         );
 
-        let next = native_configuration(
-            "http://127.0.0.1:48765/claude-desktop",
-            "updated-key",
-            "balanced",
-        );
+        let next = native_configuration("http://127.0.0.1:48765/claude-desktop", "updated-key");
         files.apply(&next).unwrap();
         assert_eq!(read(&files.profile), next);
         assert_eq!(read(&files.meta)["entries"].as_array().unwrap().len(), 2);

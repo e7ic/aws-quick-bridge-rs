@@ -526,7 +526,7 @@ struct BridgeApp {
     account_sort: tables::NumberSort,
     account_menu: Option<account_menu::AccountMenu>,
     log_filter: LogFilter,
-    log_page: usize,
+    log_page_start: usize,
     log_sort: tables::NumberSort,
 }
 
@@ -761,7 +761,7 @@ impl BridgeApp {
             account_sort: tables::NumberSort::Default,
             account_menu: None,
             log_filter: LogFilter::All,
-            log_page: 0,
+            log_page_start: 0,
             log_sort: tables::NumberSort::Default,
         }
     }
@@ -1220,7 +1220,6 @@ impl BridgeApp {
                     thread_id: String::new(),
                     title: "probe".to_string(),
                     system_prompt: String::new(),
-                    reminder: String::new(),
                     thinking_effort: String::new(),
                     web_search: false,
                     resume: false,
@@ -1405,7 +1404,6 @@ impl BridgeApp {
                                 let profile = crate::gateway::claude_desktop::native_configuration(
                                     &endpoint,
                                     &view.pool.config().api_key,
-                                    view.client_default_model(),
                                 );
                                 claude_link::apply(&profile)
                             }
@@ -1466,7 +1464,6 @@ impl BridgeApp {
                         &path,
                         &endpoint,
                         &view.snapshot.config.api_key,
-                        view.client_default_model(),
                     )?;
                     Ok(true)
                 })();

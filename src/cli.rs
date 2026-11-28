@@ -340,7 +340,6 @@ pub async fn run_cli(cli: Cli) -> Result<()> {
                         thread_id: String::new(),
                         title: "probe".to_string(),
                         system_prompt: String::new(),
-                        reminder: String::new(),
                         thinking_effort: if effort == "auto" {
                             String::new()
                         } else {

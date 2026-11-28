@@ -17,7 +17,15 @@ use quick::{account, complete, receive, send};
 
 const SIGN_IN: &str = "test-gateway-key";
 const LIMIT_NOTICE: &str = "You've reached your usage limit. Check your profile for details.";
-const DESKTOP_COMMAND: &str = r#"cd "$TEMP" && printf '%s' '“示例”'"#;
+const DESKTOP_PROMPT: &str = "read Desktop fixture";
+const DESKTOP_COMMAND: &str = r#"uv run --no-project python -X utf8 - <<'PY'
+from collections import Counter
+counts = Counter(['“示例”', '“示例”'])
+print("Today's count")
+for label, count in counts.items():
+    print(label, count, sep='\t')
+PY"#;
+const DESKTOP_STDOUT: &str = "Today's count\n“示例”\t2\n";
 
 #[expect(
     clippy::result_large_err,
@@ -122,14 +130,16 @@ async fn quick_turn(
                     json!({"text":" Check your profile for details."}),
                 )
                 .await;
-            } else if text.starts_with("read Desktop fixture") {
-                for delta in [
-                    "Reading the document. ",
-                    "<client_tool",
-                    r#"_call>{“name”:“Bash”,“arguments”:{“command”:“cd \"$TEMP\" && printf '%s' '“示例”'”}}</client_tool_call>"#,
-                ] {
+            } else if text.starts_with(DESKTOP_PROMPT) {
+                let payload = format!(
+                    "_call>{{“name”:“Bash”,“arguments”:{{“command”:“{}”}}}}</client_tool_call>",
+                    DESKTOP_COMMAND.replace('\\', "\\\\")
+                );
+                for delta in ["Reading the document. ", "<client_tool", &payload] {
                     send(&mut ws, "text_delta", json!({"text":delta})).await;
                 }
+            } else if text.starts_with("Tool result") && text.contains(DESKTOP_STDOUT) {
+                send(&mut ws, "text_delta", json!({"text": DESKTOP_STDOUT})).await;
             } else if text.starts_with("blocked Desktop tool") {
                 send(&mut ws, "text_delta", json!({
                     "text":r#"<client_tool_call>{"name":"private_tool","arguments":{}}</client_tool_call>"#
@@ -212,19 +222,23 @@ async fn check_desktop_tool_bridge(
         }},
         {"name":"private_tool","allowed_callers":["code_execution_20260120"],"input_schema":{"type":"object"}}
     ]);
-    let request = |prompt: &str, stream: bool, tools: &Value| {
+    let send_messages = |messages: Value, stream: bool, tools: &Value| {
         desktop_request(
             client,
             gateway,
             json!({
                 "model":"claude-opus-bridge", "stream":stream, "max_tokens":128,
-                "tools":tools, "messages":[{"role":"user","content":prompt}]
+                "tools":tools, "messages":messages,
+                "system":[{"type":"text","text":"You are running inside the Claude desktop app (Code tab).\nPlatform: win32\nUse the workspace tools for the document."}]
             }),
         )
     };
+    let request = |prompt: &str, stream, tools: &Value| {
+        send_messages(json!([{"role":"user","content":prompt}]), stream, tools)
+    };
 
     for stream in [false, true] {
-        let response = request("read Desktop fixture", stream, &tools)
+        let response = request(DESKTOP_PROMPT, stream, &tools)
             .send()
             .await
             .unwrap()
@@ -235,7 +249,7 @@ async fn check_desktop_tool_bridge(
             .unwrap();
         assert!(!response.contains("<client_tool_call>"));
         assert!(response.contains("Reading the document."));
-        if stream {
+        let tool_id = if stream {
             let events: Vec<Value> = response
                 .lines()
                 .filter_map(|line| line.strip_prefix("data: "))
@@ -257,6 +271,7 @@ async fn check_desktop_tool_bridge(
                     .iter()
                     .any(|event| event["delta"]["stop_reason"] == "tool_use")
             );
+            call["content_block"]["id"].as_str().unwrap().to_owned()
         } else {
             let response: Value = serde_json::from_str(&response).unwrap();
             let call = &response["content"][1];
@@ -264,15 +279,54 @@ async fn check_desktop_tool_bridge(
             assert_eq!(call["name"], "Bash");
             assert_eq!(call["input"]["command"], DESKTOP_COMMAND);
             assert_eq!(response["stop_reason"], "tool_use");
-        }
+            call["id"].as_str().unwrap().to_owned()
+        };
         let (_, sent) = turns.recv().await.unwrap();
+        assert_eq!(sent["text"], DESKTOP_PROMPT);
         assert_eq!(sent["thinking_effort"], "high");
-        assert!(
-            !sent["custom_prompt"]
-                .as_str()
-                .unwrap()
-                .contains("private_tool")
+        let preferences = sent["custom_prompt"].as_str().unwrap();
+        assert!(preferences.contains("The client is using the Code tab in Claude Desktop."));
+        assert!(preferences.contains("Platform: win32"));
+        assert!(preferences.contains("Use the workspace tools for the document."));
+        assert!(preferences.contains("<client_tool_protocol>"));
+        assert!(preferences.contains("command -v uv"));
+        assert!(preferences.contains("uv run --no-project python -X utf8 -"));
+        assert!(preferences.contains("quoted here-document"));
+        assert!(preferences.contains("verbatim tool output"));
+        assert!(!preferences.contains("python3 - <<"));
+        assert!(!preferences.contains("You are running inside"));
+        assert!(!preferences.contains("private_tool"));
+
+        let followup: Value = send_messages(
+            json!([
+                {"role":"user","content":DESKTOP_PROMPT},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"Reading the document. "},
+                    {"type":"tool_use","id":tool_id,"name":"Bash","input":{"command":DESKTOP_COMMAND}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":tool_id,"content":DESKTOP_STDOUT}
+                ]}
+            ]),
+            false,
+            &tools,
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(followup["content"][0]["text"], DESKTOP_STDOUT);
+        let (_, resumed) = turns.recv().await.unwrap();
+        assert_eq!(resumed["thread_id"], sent["thread_id"]);
+        assert_eq!(
+            resumed["text"],
+            format!("Tool result (call_id={tool_id}, name=Bash): {DESKTOP_STDOUT}")
         );
+        assert!(resumed["custom_prompt"].is_null());
     }
 
     let blocked = request("blocked Desktop tool", false, &tools)

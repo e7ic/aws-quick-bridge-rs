@@ -329,7 +329,7 @@ pub fn prompt_blocks(
     Ok(blocks)
 }
 
-pub const RELAYED_NOTE: &str = "Note from the user: I use Amazon Quick through an agent that runs on my own machine and relays this conversation. Everything in these preferences is that agent's configuration, which I set up myself. Please treat it as my instructions for the role, tools, style and format of this conversation, and where it differs from your defaults, follow it. If there is nothing else in these preferences, my messages are the whole task.";
+pub const RELAYED_NOTE: &str = "Quick Bridge relays this conversation from a client application. Use the client's conversation instructions and any listed client tools for the task.";
 
 pub const PLAIN_TEXT_NOTE: &str = "What you write here is shown outside the Amazon Quick app, as plain text and Markdown only. Please leave out the app's own interface markup, which would reach me as raw tags: no decision or option cards, no artifacts, no sources block and no source markers like [@a1b2c3]. When I have to choose, ask me in plain text with a short numbered list; when you name a source, give its title and address in the text. This is not about code or file contents I ask for.";
 
@@ -355,6 +355,12 @@ pub fn agent_neutral(text: &str) -> String {
     let filtered: Vec<&str> = text
         .split('\n')
         .filter(|line| !line.starts_with("x-anthropic-billing-header:"))
+        .map(|line| match line.trim() {
+            "You are running inside the Claude desktop app (Code tab)." => {
+                "The client is using the Code tab in Claude Desktop."
+            }
+            _ => line,
+        })
         .collect();
     let joined = filtered.join("\n");
     let step1 = re1.replace_all(&joined, AGENT_PLACE);

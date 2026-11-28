@@ -55,6 +55,8 @@ Rust 重写的 Amazon Quick（QuickWork）多协议桥接器，内置自主实�
 
 一键接入与导出配置会开启模型发现，并和 Quick Bridge 网关的 `/claude-desktop/v1/models` 使用同一份模型列表及默认档位。Quick Bridge 收到请求后会按路由选择 Quick 档位并转发给 Amazon Quick。已有 Quick Bridge 配置可在客户端卡片上点「更新接入」。[模型列表设置](https://claude.com/docs/third-party/claude-desktop/models#model-list-and-default-model)
 
+Quick Bridge 从实际请求的用量响应读取窗口上限。所有启用账号都为某个固定档位确认 1M 后，Claude Desktop 下次启动时会给该档位的新会话默认使用 1M。旧用量记录缺少档位信息，升级后需要先在该档位完成一次收到窗口上报的请求。Quick Auto 沿用标准窗口。[网关发现与上下文窗口](https://claude.com/docs/third-party/claude-desktop/gateway#context-window-and-compaction)
+
 ### 使用 CC Switch 导入 Claude Desktop
 
 1. 在「客户端接入 → Claude Desktop」点击「导入 CC Switch」。CC Switch 4.0.39 支持此导入链接。

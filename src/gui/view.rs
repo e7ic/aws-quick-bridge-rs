@@ -2,7 +2,7 @@ use super::activity::{ActivityRange, RequestActivity};
 use super::charts::format_tokens;
 use super::components::{BtnVariant, Theme};
 use super::motion::{self, SlidingTrackStyle, SpringConfig, TrackAxis};
-use super::tables::{NumberSort, TablePage};
+use super::tables::{NumberSort, TABLE_HEADER_HEIGHT, TABLE_ROW_HEIGHT, TablePage};
 use super::{
     AccountFilter, BridgeApp, GuiShared, LogFilter, MONO_FONT, PendingAction, SIDEBAR_LOGO_HEIGHT,
     SIDEBAR_LOGO_WIDTH, SignInState, THEME_TRANSITION, Tab, logo_source, numeric_font, ui_font,
@@ -24,9 +24,27 @@ use std::time::{Duration, Instant};
 const SIDEBAR_WIDTH: f32 = 192.0;
 const HEADER_HEIGHT: f32 = 48.0;
 const PAGE_RIGHT_PADDING: f32 = 12.0;
+const PAGE_BOTTOM_PADDING: f32 = 12.0;
 const PAGE_CONTENT_MAX_WIDTH: Pixels = px(1280.0);
 const LOG_LATENCY_WIDTH: f32 = 72.0;
 const LOG_MESSAGE_FONT_SIZE: f32 = 12.0;
+const LOG_HEADING_HEIGHT: f32 = 37.0;
+const LOG_PAGE_GAP: f32 = 13.0;
+const LOG_TOOLBAR_HEIGHT: f32 = 52.0;
+const LOG_CLEAR_CONFIRM_HEIGHT: f32 = 54.0;
+
+fn log_rows_per_page(page_height: Pixels, total: usize, confirming_clear: bool) -> usize {
+    let controls = LOG_HEADING_HEIGHT + LOG_PAGE_GAP + LOG_TOOLBAR_HEIGHT + TABLE_HEADER_HEIGHT;
+    let confirmation = if confirming_clear {
+        LOG_CLEAR_CONFIRM_HEIGHT
+    } else {
+        0.0
+    };
+    // The table frame contributes a one-pixel border at each edge.
+    let row_space = f32::from(page_height) - controls - confirmation - 2.0;
+    let rows = (row_space / TABLE_ROW_HEIGHT) as usize;
+    rows.saturating_sub(usize::from(total > rows)).max(1)
+}
 
 impl BridgeApp {
     fn confirm_action(
@@ -2832,7 +2850,7 @@ impl BridgeApp {
     fn select_log_filter(&mut self, filter: LogFilter) {
         if self.log_filter != filter {
             self.log_filter = filter;
-            self.log_page = 0;
+            self.log_page_start = 0;
         }
     }
 
@@ -3033,7 +3051,7 @@ impl BridgeApp {
         motion::layout(row).into_any_element()
     }
 
-    fn render_logs(&mut self, t: Theme, cx: &mut Context<Self>) -> Div {
+    fn render_logs(&mut self, t: Theme, page_height: Pixels, cx: &mut Context<Self>) -> Div {
         let logs = &self.snapshot.logs;
         let confirming_clear = self.pending_action == Some(PendingAction::ClearLogs);
         let has_warning = logs.iter().any(|entry| entry.level == LogLevel::Warn);
@@ -3072,15 +3090,21 @@ impl BridgeApp {
                     .then_with(|| self.log_sort.compare(left.latency_ms, right.latency_ms))
             });
         }
-        let page = TablePage::new(filtered.len(), self.log_page);
-        self.log_page = page.index;
+        let rows_per_page = log_rows_per_page(page_height, filtered.len(), confirming_clear);
+        // Keep the previous page's starting record visible after a window resize.
+        self.log_page_start = self.log_page_start.min(filtered.len().saturating_sub(1));
+        let page = TablePage::with_rows_per_page(
+            filtered.len(),
+            self.log_page_start / rows_per_page,
+            rows_per_page,
+        );
         let toolbar = div()
             .flex()
             .items_center()
             .justify_between()
             .gap(px(10.0))
             .px(px(14.0))
-            .py(px(10.0))
+            .h(px(LOG_TOOLBAR_HEIGHT))
             .when(show_log_filters, |el| {
                 el.child(
                     div().flex().items_center().gap(px(5.0)).children(
@@ -3134,20 +3158,26 @@ impl BridgeApp {
         let mut table = Self::table_frame(t)
             .when(!logs.is_empty(), |el| el.child(toolbar))
             .when(confirming_clear && !logs.is_empty(), |el| {
-                el.child(div().px(px(14.0)).pb(px(10.0)).child(Self::confirm_action(
-                    t,
-                    "confirm-log-clear",
-                    "这会清除本地日志及概览的请求统计。",
-                    "确认清空",
-                    |this, _, _| {
-                        let _runtime = this.rt.enter();
-                        this.pool.clear_logs();
-                        this.log_filter = LogFilter::All;
-                        this.log_page = 0;
-                        this.set_toast("已清空日志", false);
-                    },
-                    cx,
-                )))
+                el.child(
+                    div()
+                        .h(px(LOG_CLEAR_CONFIRM_HEIGHT))
+                        .px(px(14.0))
+                        .pb(px(10.0))
+                        .child(Self::confirm_action(
+                            t,
+                            "confirm-log-clear",
+                            "这会清除本地日志及概览的请求统计。",
+                            "确认清空",
+                            |this, _, _| {
+                                let _runtime = this.rt.enter();
+                                this.pool.clear_logs();
+                                this.log_filter = LogFilter::All;
+                                this.log_page_start = 0;
+                                this.set_toast("已清空日志", false);
+                            },
+                            cx,
+                        )),
+                )
             });
         if filtered.is_empty() {
             let empty = if logs.is_empty() {
@@ -3196,7 +3226,7 @@ impl BridgeApp {
                             self.log_sort,
                             |this| {
                                 this.log_sort = this.log_sort.cycle();
-                                this.log_page = 0;
+                                this.log_page_start = 0;
                             },
                             cx,
                         ))
@@ -3212,7 +3242,7 @@ impl BridgeApp {
                         t,
                         "log-page",
                         page,
-                        |this, index| this.log_page = index,
+                        move |this, index| this.log_page_start = index * rows_per_page,
                         cx,
                     ))
                 });
@@ -3221,8 +3251,8 @@ impl BridgeApp {
         div()
             .flex()
             .flex_col()
-            .gap(px(13.0))
-            .child(Self::page_heading(t, "日志"))
+            .gap(px(LOG_PAGE_GAP))
+            .child(Self::page_heading(t, "日志").line_height(px(LOG_HEADING_HEIGHT)))
             .child(motion::layout(table.id("log-table")))
     }
 }
@@ -3243,7 +3273,8 @@ impl Render for BridgeApp {
         }
         t.keyboard_focus = self.keyboard_focus;
         let shared = self.visible_state.clone();
-        let width = window.viewport_size().width;
+        let viewport = window.viewport_size();
+        let width = viewport.width;
         let compact = width < px(1020.0);
         let page_padding = if compact { 14.0 } else { 18.0 };
         let section = match self.active_tab {
@@ -3273,11 +3304,15 @@ impl Render for BridgeApp {
                 self.render_clients(t, &shared, content_width, cx)
             }
             Tab::Settings => self.render_settings(t, &shared, cx),
-            Tab::Logs => self.render_logs(t, cx),
+            Tab::Logs => {
+                let insets = HEADER_HEIGHT + PAGE_BOTTOM_PADDING + 2.0 * (page_padding + 1.0);
+                self.render_logs(t, viewport.height - px(insets), cx)
+            }
         }
         .w_full()
-        .max_w(PAGE_CONTENT_MAX_WIDTH)
-        .mx_auto();
+        .when(self.active_tab != Tab::Logs, |el| {
+            el.max_w(PAGE_CONTENT_MAX_WIDTH).mx_auto()
+        });
 
         div()
             .id("quick-bridge-app")
@@ -3295,7 +3330,7 @@ impl Render for BridgeApp {
                     .flex()
                     .flex_col()
                     .pr(px(PAGE_RIGHT_PADDING))
-                    .pb(px(12.0))
+                    .pb(px(PAGE_BOTTOM_PADDING))
                     .child(
                         div()
                             .flex()
@@ -3432,5 +3467,19 @@ impl Render for BridgeApp {
                     cx,
                 ))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_capacity_fills_the_available_height_and_accounts_for_controls() {
+        assert_eq!(log_rows_per_page(px(632.0), 34, false), 9);
+        assert_eq!(log_rows_per_page(px(1270.0), 34, false), 22);
+        assert_eq!(log_rows_per_page(px(1270.0), 34, true), 21);
+        assert_eq!(log_rows_per_page(px(1270.0), 23, false), 23);
+        assert_eq!(log_rows_per_page(px(80.0), 34, false), 1);
     }
 }

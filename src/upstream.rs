@@ -151,7 +151,6 @@ pub struct TurnInput {
     pub thread_id: String,
     pub title: String,
     pub system_prompt: String,
-    pub reminder: String,
     pub thinking_effort: String,
     pub web_search: bool,
     pub resume: bool,
@@ -289,11 +288,6 @@ pub struct UpstreamResult {
 }
 
 pub fn user_message(session: &UpstreamSession, cfg: &Settings, input: &TurnInput) -> Value {
-    let text = if input.reminder.is_empty() {
-        input.prompt.clone()
-    } else {
-        format!("{}\n\n{}", input.prompt, input.reminder)
-    };
     let agent_mode = if input.model == "auto" {
         "smart"
     } else {
@@ -305,7 +299,7 @@ pub fn user_message(session: &UpstreamSession, cfg: &Settings, input: &TurnInput
         Value::String(input.system_prompt.clone())
     };
     let mut payload = serde_json::Map::new();
-    payload.insert("text".into(), json!(text));
+    payload.insert("text".into(), json!(input.prompt));
     payload.insert("send_origin".into(), json!("programmatic"));
     payload.insert("had_physical_input".into(), json!(false));
     payload.insert("surfaceType".into(), json!(session.surface));

@@ -646,6 +646,7 @@ async fn execute_request(
                 let pool_done = pool.clone();
                 let acc_label_done = acc_label.clone();
                 let req_model_done = mapped_model.clone();
+                let routed_mode = mode.to_owned();
                 let route = if mode == turn.model {
                     mapped_model.clone()
                 } else {
@@ -686,6 +687,7 @@ async fn execute_request(
                     active_request.finish(&resolved);
                     pool_done.push_gateway_log(
                         &acc_key,
+                        &routed_mode,
                         RequestLogEntry {
                             timestamp: Utc::now(),
                             level,
@@ -727,6 +729,7 @@ async fn execute_request(
                     .unwrap_or_default();
                 pool.push_gateway_log(
                     &acc_key,
+                    mode,
                     RequestLogEntry {
                         timestamp: Utc::now(),
                         level: failure_level(f.status),
@@ -819,9 +822,10 @@ async fn dispatch(
     }
 
     match (method.clone(), path.as_str()) {
-        (Method::GET, "/models") if desktop => {
-            models_response(claude_desktop::list_models(&pool.settings().default_model))
-        }
+        (Method::GET, "/models") if desktop => models_response(claude_desktop::list_models(
+            &pool.settings().default_model,
+            &pool.claude_desktop_1m_modes(),
+        )),
         (Method::GET, "/models") => handle_models(&pool).await,
         (Method::POST, "/chat/completions") if !desktop => {
             execute_with_pool(pool, ApiKind::Chat, headers, body, false).await

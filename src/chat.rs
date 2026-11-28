@@ -10,8 +10,8 @@ use crate::messages::{
 use crate::qbs::{self, SpentAllowance, UploadedAttachment};
 use crate::threads::{ThreadHistory, ThreadMatch, ThreadPrompt, ThreadStore, ToolAnchor, digest};
 use crate::toolbridge::{
-    BridgeStream, TOOL_DETAILS, TOOL_REMINDER, ToolCallError, ToolCallReply, ToolDetail,
-    build_tool_bridge_prompt, parse_client_tool_calls, parse_tool_choice, requested_tool_names,
+    BridgeStream, TOOL_DETAILS, ToolCallError, ToolCallReply, ToolDetail, build_tool_bridge_prompt,
+    parse_client_tool_calls, parse_tool_choice, requested_tool_names,
 };
 use crate::upstream::{
     ContextUsage, TurnInput, UpstreamError, UpstreamErrorKind, UpstreamEvent, UpstreamSession,
@@ -464,11 +464,6 @@ pub fn prepare(body: &Value, cfg: &Settings) -> Result<PreparedTurn> {
             thread_id: String::new(),
             title: title_for(&last_user_text(&messages)),
             system_prompt: custom_full,
-            reminder: if bridge {
-                TOOL_REMINDER.to_string()
-            } else {
-                String::new()
-            },
             thinking_effort: thinking_effort(body, &cfg.thinking_effort),
             web_search,
             resume: false,

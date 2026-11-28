@@ -5,27 +5,36 @@ use gpui::{AnyElement, Context, Div, FontWeight, div, prelude::*, px};
 use std::{cmp::Ordering, ops::Range};
 
 const TABLE_ROWS_PER_PAGE: usize = 10;
+pub(super) const TABLE_ROW_HEIGHT: f32 = 48.0;
+pub(super) const TABLE_HEADER_HEIGHT: f32 = 35.0;
 
 #[derive(Clone, Copy)]
 pub(super) struct TablePage {
     pub(super) index: usize,
     count: usize,
     total: usize,
+    rows_per_page: usize,
 }
 
 impl TablePage {
     pub(super) fn new(total: usize, requested: usize) -> Self {
-        let count = total.div_ceil(TABLE_ROWS_PER_PAGE);
+        Self::with_rows_per_page(total, requested, TABLE_ROWS_PER_PAGE)
+    }
+
+    pub(super) fn with_rows_per_page(total: usize, requested: usize, rows_per_page: usize) -> Self {
+        let rows_per_page = rows_per_page.max(1);
+        let count = total.div_ceil(rows_per_page);
         Self {
             index: requested.min(count.saturating_sub(1)),
             count,
             total,
+            rows_per_page,
         }
     }
 
     pub(super) fn range(self) -> Range<usize> {
-        let start = self.index * TABLE_ROWS_PER_PAGE;
-        start..start.saturating_add(TABLE_ROWS_PER_PAGE).min(self.total)
+        let start = self.index * self.rows_per_page;
+        start..start.saturating_add(self.rows_per_page).min(self.total)
     }
 
     pub(super) fn has_multiple_pages(self) -> bool {
@@ -85,14 +94,14 @@ impl BridgeApp {
             .items_center()
             .gap(px(12.0))
             .px(px(14.0))
-            .min_h(px(48.0))
+            .min_h(px(TABLE_ROW_HEIGHT))
             .border_t_1()
             .border_color(t.border_subtle)
     }
 
     pub(super) fn table_header(t: Theme) -> Div {
         Self::table_row(t)
-            .min_h(px(35.0))
+            .min_h(px(TABLE_HEADER_HEIGHT))
             .bg(t.bg_well)
             .text_size(px(11.5))
             .font_weight(FontWeight::MEDIUM)
@@ -142,7 +151,7 @@ impl BridgeApp {
         t: Theme,
         id: &'static str,
         page: TablePage,
-        on_page: fn(&mut Self, usize),
+        on_page: impl Fn(&mut Self, usize) + Copy + 'static,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let range = page.range();
@@ -226,6 +235,16 @@ mod tests {
         assert!(!filtered.has_multiple_pages());
         assert_eq!(TablePage::new(0, 2).range(), 0..0);
         assert_eq!(TablePage::new(300, 29).range(), 290..300);
+    }
+
+    #[test]
+    fn custom_page_size_counts_a_partial_last_page() {
+        let first = TablePage::with_rows_per_page(34, 0, 22);
+        assert_eq!(first.range(), 0..22);
+        let last = TablePage::with_rows_per_page(34, first.next().unwrap(), 22);
+        assert_eq!(last.range(), 22..34);
+        assert_eq!(last.next(), None);
+        assert_eq!(TablePage::with_rows_per_page(3, 1, 22).range(), 0..3);
     }
 
     #[test]

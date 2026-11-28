@@ -211,6 +211,7 @@ mod tests {
                 used_tokens: Some(u64::from(second)),
                 window_tokens: NonZeroU64::new(200_000),
             }),
+            quick_mode: None,
         };
         let mut history = UsageHistory::default();
         let messages = RequestProtocol::Messages;

@@ -1,13 +1,14 @@
 use super::RequestLogEntry;
 use super::request_stats::{RequestProtocol, RequestSample};
-use crate::config::write_secure_file;
+use crate::config::{CLAUDE_ROLE_MODES, write_secure_file};
 use crate::upstream::ContextUsage;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Days, Local, NaiveDate, Timelike, Utc};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use parking_lot::Mutex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub(crate) const USAGE_RETENTION_DAYS: u64 = 30;
+const MILLION_TOKENS: u64 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UsageTotals {
@@ -56,12 +58,14 @@ struct AccountLabel {
 
 type UsageBuckets = BTreeMap<UsageBucket, UsageTotals>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContextSample {
     #[serde(with = "chrono::serde::ts_milliseconds")]
     pub(crate) timestamp: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) usage: Option<ContextUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quick_mode: Option<String>,
 }
 
 type ContextBuckets = BTreeMap<UsageBucket, Vec<ContextSample>>;
@@ -85,6 +89,50 @@ pub(crate) struct UsageHistory {
 }
 
 impl UsageHistory {
+    pub(super) fn confirmed_1m_modes(&self, accounts: &HashSet<String>) -> HashSet<&'static str> {
+        if accounts.is_empty() {
+            return HashSet::new();
+        }
+        let oldest = Local::now().date_naive() - Days::new(USAGE_RETENTION_DAYS - 1);
+        let mut latest = BTreeMap::new();
+        for (bucket, samples) in &self.contexts {
+            if bucket.date < oldest || !accounts.contains(&bucket.account) {
+                continue;
+            }
+            for sample in samples {
+                if let Some(mode) = sample.quick_mode.as_deref()
+                    && let Some(window) = sample.usage.and_then(|usage| usage.window_tokens)
+                {
+                    // A mode can serve more than one model. Keep each model's newest report.
+                    let report = (Reverse(sample.timestamp), window.get());
+                    let newest = latest
+                        .entry((bucket.account.as_str(), mode, bucket.model.as_str()))
+                        .or_insert(report);
+                    *newest = (*newest).min(report);
+                }
+            }
+        }
+
+        let mut minimums = BTreeMap::new();
+        for ((account, mode, _), (_, window)) in latest {
+            let minimum = minimums.entry((account, mode)).or_insert(window);
+            *minimum = (*minimum).min(window);
+        }
+        CLAUDE_ROLE_MODES
+            .iter()
+            .filter_map(|&(_, mode)| {
+                accounts
+                    .iter()
+                    .all(|account| {
+                        minimums
+                            .get(&(account.as_str(), mode))
+                            .is_some_and(|&window| window >= MILLION_TOKENS)
+                    })
+                    .then_some(mode)
+            })
+            .collect()
+    }
+
     #[cfg(feature = "gui")]
     pub(crate) fn account_label(&self, key: &str) -> Option<&str> {
         self.accounts.get(key).map(|label| label.name.as_str())
@@ -217,12 +265,17 @@ impl UsageStore {
         }
     }
 
-    #[cfg(feature = "gui")]
     pub(super) fn snapshot(&self) -> Arc<UsageHistory> {
         self.state.lock().visible.clone()
     }
 
-    pub(super) fn record(&self, account: &str, sample: RequestSample, entry: &RequestLogEntry) {
+    pub(super) fn record(
+        &self,
+        account: &str,
+        mode: &str,
+        sample: RequestSample,
+        entry: &RequestLogEntry,
+    ) {
         let at = sample.timestamp.with_timezone(&Local);
         let bucket = UsageBucket {
             date: at.date_naive(),
@@ -241,12 +294,24 @@ impl UsageStore {
             output: sample.output_tokens,
             cache_read: entry.cached_tokens,
         };
+        // A smaller window can invalidate support even when the turn failed.
+        let quick_mode = entry
+            .context
+            .and_then(|usage| usage.window_tokens)
+            .filter(|window| sample.succeeded || window.get() < MILLION_TOKENS)
+            .filter(|_| {
+                CLAUDE_ROLE_MODES
+                    .iter()
+                    .any(|&(_, fixed_mode)| fixed_mode == mode)
+            })
+            .map(|_| mode.to_owned());
         let context = Some(ContextSample {
             timestamp: sample.timestamp,
             usage: entry.context,
+            quick_mode,
         });
         let mut state = self.state.lock();
-        Arc::make_mut(&mut state.visible).record(bucket.clone(), &label, totals, context);
+        Arc::make_mut(&mut state.visible).record(bucket.clone(), &label, totals, context.clone());
         state.pending.record(bucket, &label, totals, context);
     }
 
@@ -325,6 +390,9 @@ fn read_cache(path: &Path) -> Result<UsageHistory> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeDelta;
+    use serde_json::json;
+    use std::num::NonZeroU64;
 
     fn bucket(date: NaiveDate, hour: u32) -> UsageBucket {
         UsageBucket {
@@ -367,6 +435,7 @@ mod tests {
                         used_tokens: Some(2_000),
                         window_tokens: std::num::NonZeroU64::new(200_000),
                     }),
+                    quick_mode: None,
                 };
                 history.record(bucket(date, hour), &label, totals, Some(context));
             }
@@ -435,5 +504,70 @@ mod tests {
             }
         );
         assert!(fs::metadata(path).unwrap().len() < 512);
+    }
+
+    #[test]
+    fn context_support_ignores_legacy_and_expired_reports_and_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("usage-history-v1.json.gz");
+        let store = UsageStore::load(path.clone());
+        let now = Utc::now();
+        let date = now.with_timezone(&Local).date_naive();
+        let (label, totals) = fixtures();
+        let legacy: ContextSample = serde_json::from_value(json!({
+            "timestamp": now.timestamp_millis(),
+            "usage": {"used_tokens": 2_000, "window_tokens": MILLION_TOKENS}
+        }))
+        .unwrap();
+        store
+            .state
+            .lock()
+            .pending
+            .record(bucket(date, 0), &label, totals, Some(legacy));
+        store.save();
+        let accounts = HashSet::from(["account-a".into()]);
+        let supported = || store.snapshot().confirmed_1m_modes(&accounts);
+        assert!(supported().is_empty());
+
+        let record = |timestamp, status, window| {
+            let entry = RequestLogEntry {
+                timestamp,
+                level: crate::pool::LogLevel::Info,
+                api: "messages".into(),
+                requested_model: "smart".into(),
+                resolved_model: "resolved-model".into(),
+                account: label.name.clone(),
+                status,
+                latency_ms: 10,
+                input_tokens: 2_000,
+                output_tokens: 180,
+                cached_tokens: 800,
+                context: Some(ContextUsage {
+                    used_tokens: Some(2_000),
+                    window_tokens: NonZeroU64::new(window),
+                }),
+                message: String::new(),
+            };
+            store.record(
+                "account-a",
+                "smart",
+                RequestSample::from_log(&entry).unwrap(),
+                &entry,
+            );
+        };
+        record(now - TimeDelta::days(31), 200, MILLION_TOKENS);
+        record(now - TimeDelta::seconds(4), 502, MILLION_TOKENS);
+        assert!(supported().is_empty());
+        record(now - TimeDelta::seconds(3), 200, MILLION_TOKENS);
+        assert_eq!(supported(), HashSet::from(["smart"]));
+        record(now - TimeDelta::seconds(2), 502, 200_000);
+        assert!(supported().is_empty());
+        record(now - TimeDelta::seconds(1), 200, 1_048_576);
+        store.save();
+        let reloaded = UsageStore::load(path);
+        assert_eq!(
+            reloaded.snapshot().confirmed_1m_modes(&accounts),
+            HashSet::from(["smart"])
+        );
     }
 }

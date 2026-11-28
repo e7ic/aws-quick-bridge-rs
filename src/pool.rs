@@ -274,6 +274,18 @@ impl AccountPool {
             .count()
     }
 
+    pub(crate) fn claude_desktop_1m_modes(&self) -> HashSet<&'static str> {
+        let accounts = self
+            .accounts
+            .read()
+            .records
+            .iter()
+            .filter(|account| account.record.enabled)
+            .map(|account| account.record.key())
+            .collect();
+        self.usage_stats.snapshot().confirmed_1m_modes(&accounts)
+    }
+
     pub fn update_config(&self, cfg: BridgeConfig) -> Result<()> {
         save_config(&cfg)?;
         *self.config.write() = cfg;
@@ -422,10 +434,10 @@ impl AccountPool {
         self.append_log(entry, sample);
     }
 
-    pub(crate) fn push_gateway_log(&self, account_key: &str, entry: RequestLogEntry) {
+    pub(crate) fn push_gateway_log(&self, account_key: &str, mode: &str, entry: RequestLogEntry) {
         let sample = RequestSample::from_log(&entry);
         if let Some(sample) = sample {
-            self.usage_stats.record(account_key, sample, &entry);
+            self.usage_stats.record(account_key, mode, sample, &entry);
             self.usage_stats.schedule_save();
         }
         self.append_log(entry, sample);
@@ -1157,8 +1169,8 @@ mod tests {
             }),
             ..failure.clone()
         };
-        pool.push_gateway_log("account-a", failure);
-        pool.push_gateway_log("account-b", completed.clone());
+        pool.push_gateway_log("account-a", "smart", failure);
+        pool.push_gateway_log("account-b", "smart", completed.clone());
         pool.push_log(completed);
         pool.clear_logs();
         pool.flush_request_stats();
